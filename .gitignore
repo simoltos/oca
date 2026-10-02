@@ -1,0 +1,7 @@
+oca
+*.o
+tests/test_*
+tests/oca-fixture
+tests/sandbox-kernel-worker
+TODO.md
+misc/
