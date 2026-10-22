@@ -1,0 +1,2 @@
+// antirez/ds4 5379c1c9ac315f1540371b06a3db88491d4059ff, ds4_web.c (MIT; see LICENSE).
+(() => {const clean=s=>(s||'').replace(/\s+/g,' ').trim();const pats=[/accept all/i,/i agree/i,/agree/i,/accetta tutto/i,/tout accepter/i,/aceptar todo/i,/alle akzeptieren/i];const els=[...document.querySelectorAll('button,[role=button],input[type=submit],a')];for (const el of els){const t=clean(el.innerText||el.value||el.textContent);if(!t)continue; if(pats.some(p=>p.test(t))){el.click(); return 'clicked '+t;}}return '';})()

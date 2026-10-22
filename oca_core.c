@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <cjson/cJSON.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -1960,6 +1962,8 @@ struct oca_core {
     char *goal_first_turn;
     char *ia_answers_json;
     int ia_waiting;
+    int browser_approval_waiting;
+    int browser_approval_answer;
     int save_answer;             /* -1 none, 0 no, 1 yes */
     int save_waiting;
     int quit_requested;
@@ -2559,6 +2563,18 @@ static const char *const TOOL_ASK_DESC =
     "The interface adds None of the above and optional free-text details.";
 static const char *const TOOL_GOAL_DESC =
     "Report the active goal as complete or blocked. An optional message can explain the result.";
+static const char *const TOOL_SEARCH_DESC =
+    "Search Google in a visible Firefox browser and return compact Markdown links. "
+    "The first web call may ask the user for permission to start Firefox.";
+static const char *const TOOL_VISIT_DESC =
+    "Open a URL in a visible Firefox browser and return rendered page Markdown. "
+    "Long output includes a temporary file path; use read to inspect more rendered Markdown.";
+static const char *const SCHEMA_SEARCH =
+    "{\"type\":\"object\",\"properties\":{"
+    "\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}";
+static const char *const SCHEMA_VISIT =
+    "{\"type\":\"object\",\"properties\":{"
+    "\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}";
 static const char *const SCHEMA_READ =
     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
     "\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}},"
@@ -2633,6 +2649,8 @@ static void build_tool_defs(oca_core *c, oca_request *req) {
     oca_request_add_tool(req, "bash", TOOL_BASH_DESC, SCHEMA_BASH);
     oca_request_add_tool(req, "write", TOOL_WRITE_DESC, SCHEMA_WRITE);
     oca_request_add_tool(req, "edit", TOOL_EDIT_DESC, SCHEMA_EDIT);
+    oca_request_add_tool(req, "google_search", TOOL_SEARCH_DESC, SCHEMA_SEARCH);
+    oca_request_add_tool(req, "visit_page", TOOL_VISIT_DESC, SCHEMA_VISIT);
     if (c->interactive) {
         oca_request_add_tool(req, "ask_user", TOOL_ASK_DESC, SCHEMA_ASK);
         if (c->goal_state == OCA_GOAL_ACTIVE) {
@@ -3187,6 +3205,589 @@ cleanup:
  * access. Each worker is bounded by the shared timeout and output limits.
  * ========================================================================== */
 
+/* Firefox DevTools implements the same browser operations as ds4's Chrome
+ * CDP backend. RDP actors belong to a connection, so closing an interrupted
+ * connection does not leave a global WebDriver session behind. */
+#define BROWSER_DEFAULT_PORT 9333
+#define BROWSER_WIRE_MAX (4 * 1024 * 1024)
+#define BROWSER_COMMAND_MS 20000
+#ifndef BROWSER_APPROVAL_SECONDS
+#define BROWSER_APPROVAL_SECONDS 30
+#endif
+#define BROWSER_HEAD_BYTES (8 * 1024)
+#define BROWSER_HEAD_LINES 100
+
+static long long executor_now_ms(void);
+static volatile sig_atomic_t browser_interrupt;
+
+typedef struct {
+    int fd;
+    int cleanup;
+    const atomic_int *cancel;
+    char error[512];
+} browser_connection;
+
+static int browser_tool(const char *name) {
+    return !strcmp(name, "google_search") || !strcmp(name, "visit_page");
+}
+
+static int browser_endpoint_port(const char *endpoint) {
+    if (!endpoint || strncmp(endpoint, "127.0.0.1:", 10) || strlen(endpoint) > 15 ||
+        !isdigit((unsigned char)endpoint[10])) return 0;
+    char *end = NULL;
+    long port = strtol(endpoint + 10, &end, 10);
+    return port > 0 && port <= 65535 && end && !*end ? (int)port : 0;
+}
+
+static int browser_arguments(const char *name, const cJSON *args, char *err, size_t errsz) {
+    const char *key = !strcmp(name, "google_search") ? "query" : "url";
+    const char *value = json_text(args, key);
+    if (!value || !*value) {
+        err_set(err, errsz, "%s requires %s", name, key);
+        return -1;
+    }
+    return 0;
+}
+
+static void browser_signal(int number) {
+    (void)number;
+    browser_interrupt = 1;
+}
+
+static int browser_cancelled(browser_connection *b) {
+    if (!b->cleanup && (browser_interrupt || (b->cancel && atomic_load(b->cancel)))) {
+        err_set(b->error, sizeof(b->error), "interrupted");
+        return 1;
+    }
+    return 0;
+}
+
+static int browser_sleep(browser_connection *b, int milliseconds) {
+    for (int elapsed = 0; elapsed < milliseconds; elapsed += 25) {
+        if (browser_cancelled(b)) return -1;
+        int amount = milliseconds - elapsed < 25 ? milliseconds - elapsed : 25;
+        struct timespec delay = {0, amount * 1000000L};
+        nanosleep(&delay, NULL);
+    }
+    return browser_cancelled(b) ? -1 : 0;
+}
+
+static int browser_wait(browser_connection *b, short events, long long deadline) {
+    if (browser_cancelled(b)) return -1;
+    long long now = executor_now_ms();
+    if (now < 0 || now >= deadline) {
+        err_set(b->error, sizeof(b->error), "Firefox DevTools request timed out"); return -1;
+    }
+    struct pollfd fd = {b->fd, events, 0};
+    int rc = poll(&fd, 1, (int)(deadline - now > 100 ? 100 : deadline - now));
+    if ((rc < 0 && errno != EINTR) || fd.revents & (POLLERR | POLLNVAL) ||
+        ((fd.revents & POLLHUP) && !(fd.revents & events))) {
+        err_set(b->error, sizeof(b->error), "Firefox DevTools connection closed"); return -1;
+    }
+    return 0;
+}
+
+static int browser_io(browser_connection *b, void *bytes, size_t length, int sending,
+                       long long deadline) {
+    char *p = bytes;
+    while (length) {
+        if (browser_wait(b, sending ? POLLOUT : POLLIN, deadline)) return -1;
+        ssize_t n;
+        if (sending) {
+#ifdef MSG_NOSIGNAL
+            n = send(b->fd, p, length, MSG_NOSIGNAL);
+#else
+            n = send(b->fd, p, length, 0);
+#endif
+        } else n = recv(b->fd, p, length, 0);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+        if (n <= 0) {
+            err_set(b->error, sizeof(b->error), "Firefox DevTools connection closed"); return -1;
+        }
+        p += n; length -= (size_t)n;
+    }
+    return 0;
+}
+
+static cJSON *browser_receive(browser_connection *b, long long deadline) {
+    size_t length = 0;
+    int digits = 0;
+    for (;;) {
+        char c;
+        if (browser_io(b, &c, 1, 0, deadline)) return NULL;
+        if (c == ':' && digits) break;
+        if (c < '0' || c > '9' || ++digits > 8 ||
+            length > (BROWSER_WIRE_MAX - (size_t)(c - '0')) / 10) {
+            err_set(b->error, sizeof(b->error), "invalid or oversized Firefox DevTools packet"); return NULL;
+        }
+        length = length * 10 + (size_t)(c - '0');
+    }
+    char *text = malloc(length + 1);
+    if (!text) { err_set(b->error, sizeof(b->error), "out of memory"); return NULL; }
+    if (browser_io(b, text, length, 0, deadline)) { free(text); return NULL; }
+    text[length] = 0;
+    const char *why = NULL;
+    cJSON *reply = json_parse(text, length, &why);
+    free(text);
+    if (!cJSON_IsObject(reply)) {
+        cJSON_Delete(reply); err_set(b->error, sizeof(b->error), "invalid Firefox DevTools JSON"); return NULL;
+    }
+    return reply;
+}
+
+/* Takes ownership of parameters. Events are not request replies. */
+static cJSON *browser_command(browser_connection *b, const char *actor, const char *method,
+                               cJSON *parameters, int timeout) {
+    b->error[0] = 0;
+    if (browser_cancelled(b)) { cJSON_Delete(parameters); return NULL; }
+    int ok = parameters && actor && cJSON_AddStringToObject(parameters, "to", actor) &&
+        cJSON_AddStringToObject(parameters, "type", method);
+    char *json = ok ? cJSON_PrintUnformatted(parameters) : NULL;
+    cJSON_Delete(parameters);
+    if (!json) { err_set(b->error, sizeof(b->error), "out of memory"); return NULL; }
+    char header[32];
+    size_t length = strlen(json);
+    int n = snprintf(header, sizeof(header), "%zu:", length);
+    long long deadline = executor_now_ms() + timeout;
+    ok = !browser_io(b, header, (size_t)n, 1, deadline) && !browser_io(b, json, length, 1, deadline);
+    cJSON_free(json);
+    if (!ok) return NULL;
+    for (;;) {
+        cJSON *reply = browser_receive(b, deadline);
+        if (!reply) return NULL;
+        const char *from = json_text(reply, "from"), *error = json_text(reply, "error");
+        if (from && !strcmp(from, actor) && error) {
+            const char *message = json_text(reply, "message");
+            err_set(b->error, sizeof(b->error), "%s: %s", error, message ? message : method);
+            cJSON_Delete(reply); return NULL;
+        }
+        if (from && !strcmp(from, actor) && !json_text(reply, "type")) return reply;
+        cJSON_Delete(reply);
+    }
+}
+
+static cJSON *browser_params(const char *key, const char *value) {
+    cJSON *p = cJSON_CreateObject();
+    if (p && key && !cJSON_AddStringToObject(p, key, value)) { cJSON_Delete(p); return NULL; }
+    return p;
+}
+
+static int browser_connect(browser_connection *b, const char *endpoint) {
+    int port = browser_endpoint_port(endpoint);
+    b->fd = -1;
+    if (!port) { err_set(b->error, sizeof(b->error), "invalid Firefox DevTools endpoint"); return -1; }
+    b->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (b->fd < 0 || fcntl(b->fd, F_SETFL, O_NONBLOCK) || fcntl(b->fd, F_SETFD, FD_CLOEXEC)) goto fail;
+#ifdef SO_NOSIGPIPE
+    int yes = 1; setsockopt(b->fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((unsigned short)port),
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int rc = connect(b->fd, (struct sockaddr *)&address, sizeof(address));
+    if (rc < 0 && errno != EINPROGRESS) goto fail;
+    long long deadline = executor_now_ms() + 3000;
+    if (rc < 0) {
+        for (;;) {
+            if (browser_wait(b, POLLOUT, deadline)) goto fail;
+            struct pollfd fd = {b->fd, POLLOUT, 0};
+            if (poll(&fd, 1, 0) <= 0) continue;
+            int error = 0; socklen_t size = sizeof(error);
+            if (getsockopt(b->fd, SOL_SOCKET, SO_ERROR, &error, &size) || error) goto fail;
+            break;
+        }
+    }
+    cJSON *hello = browser_receive(b, deadline);
+    const char *type = json_text(hello, "applicationType"), *from = json_text(hello, "from");
+    int valid = type && !strcmp(type, "browser") && from && !strcmp(from, "root");
+    cJSON_Delete(hello);
+    if (!valid) goto fail;
+    cJSON *connected = browser_command(b, "root", "connect", cJSON_CreateObject(), 3000);
+    if (!connected) goto fail;
+    cJSON_Delete(connected);
+    return 0;
+fail:
+    if (!b->error[0]) err_set(b->error, sizeof(b->error), "cannot connect to Firefox DevTools at %s", endpoint);
+    if (b->fd >= 0) close(b->fd);
+    b->fd = -1;
+    return -1;
+}
+
+static char *browser_evaluate_actor(browser_connection *b, const char *actor, const char *expression) {
+    cJSON *p = browser_params("text", expression);
+    cJSON *mapped = p ? cJSON_AddObjectToObject(p, "mapped") : NULL;
+    /* Await through the promise actor. Holding a console evaluation open can
+     * defer page scroll events in Firefox, unlike CDP's awaitPromise. */
+    if (!mapped || !cJSON_AddBoolToObject(mapped, "await", 0)) { cJSON_Delete(p); p = NULL; }
+    int timeout = b->cleanup ? 1500 : BROWSER_COMMAND_MS;
+    cJSON *reply = browser_command(b, actor, "evaluateJSAsync", p, timeout);
+    const char *id = json_text(reply, "resultID");
+    char *result_id = id ? xstrdup(id) : NULL;
+    cJSON_Delete(reply);
+    if (!result_id) { if (!b->error[0]) err_set(b->error, sizeof(b->error), "missing Firefox evaluation identifier"); return NULL; }
+    long long deadline = executor_now_ms() + timeout;
+    char *result = NULL;
+    for (;;) {
+        reply = browser_receive(b, deadline);
+        if (!reply) break;
+        const char *kind = json_text(reply, "type"), *from = json_text(reply, "from"),
+                   *returned_id = json_text(reply, "resultID");
+        if (!kind || strcmp(kind, "evaluationResult") || !from || strcmp(from, actor) ||
+            !returned_id || strcmp(returned_id, result_id)) { cJSON_Delete(reply); continue; }
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(reply, "result");
+        cJSON *settled = NULL;
+        const char *value_class = json_text(value, "class");
+        if (value_class && !strcmp(value_class, "Promise")) {
+            const char *promise_actor = json_text(value, "actor");
+            while (promise_actor && executor_now_ms() < deadline) {
+                int remaining = (int)(deadline - executor_now_ms());
+                if (remaining <= 0) break;
+                cJSON *state_reply = browser_command(b, promise_actor, "promiseState", cJSON_CreateObject(), remaining);
+                const cJSON *state_object = cJSON_GetObjectItemCaseSensitive(state_reply, "promiseState");
+                const char *state = json_text(state_object, "state");
+                int pending = state && !strcmp(state, "pending");
+                if (state && !strcmp(state, "fulfilled"))
+                    settled = cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(state_object, "value"), 1);
+                else if (state && !strcmp(state, "rejected"))
+                    err_set(b->error, sizeof(b->error), "page promise rejected");
+                cJSON_Delete(state_reply);
+                if (!pending || browser_sleep(b, 100)) break;
+            }
+            if (!settled && !b->error[0]) err_set(b->error, sizeof(b->error), "Firefox page promise did not settle");
+            value = settled;
+        }
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "hasException")) ||
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "topLevelAwaitRejected"))) {
+            const char *message = json_text(reply, "exceptionMessage");
+            err_set(b->error, sizeof(b->error), "page script failed: %s", message ? message : "rejected promise");
+        } else if (cJSON_IsString(value)) result = xstrdup(value->valuestring);
+        else if (json_text(value, "type") && !strcmp(json_text(value, "type"), "longString")) {
+            long length = 0;
+            const char *string_actor = json_text(value, "actor");
+            p = cJSON_CreateObject();
+            int valid = string_actor && json_integer(cJSON_GetObjectItemCaseSensitive(value, "length"), &length) &&
+                length >= 0 && length <= BROWSER_WIRE_MAX && p &&
+                cJSON_AddNumberToObject(p, "start", 0) && cJSON_AddNumberToObject(p, "end", length);
+            if (!valid) { cJSON_Delete(p); err_set(b->error, sizeof(b->error), "invalid or oversized page string"); }
+            else {
+                cJSON *substring = browser_command(b, string_actor, "substring", p, timeout);
+                const char *text = json_text(substring, "substring");
+                if (text) result = xstrdup(text);
+                cJSON_Delete(substring);
+            }
+        }
+        cJSON_Delete(settled);
+        cJSON_Delete(reply);
+        break;
+    }
+    free(result_id);
+    if (!result && !b->error[0]) err_set(b->error, sizeof(b->error), "page script did not return text");
+    return result;
+}
+
+static char *browser_target_console(browser_connection *b, const char *descriptor, int parent) {
+    cJSON *reply = browser_command(b, descriptor, "getTarget", cJSON_CreateObject(), b->cleanup ? 500 : BROWSER_COMMAND_MS);
+    const char *actor = json_text(cJSON_GetObjectItemCaseSensitive(reply, parent ? "process" : "frame"), "consoleActor");
+    char *copy = actor ? xstrdup(actor) : NULL;
+    cJSON_Delete(reply);
+    if (!copy && !b->error[0]) err_set(b->error, sizeof(b->error), "Firefox did not return a page console");
+    return copy;
+}
+
+static char *browser_parent_console(browser_connection *b) {
+    cJSON *p = cJSON_CreateObject();
+    if (p && !cJSON_AddNumberToObject(p, "id", 0)) { cJSON_Delete(p); p = NULL; }
+    cJSON *reply = browser_command(b, "root", "getProcess", p, b->cleanup ? 500 : BROWSER_COMMAND_MS);
+    const char *descriptor = json_text(cJSON_GetObjectItemCaseSensitive(reply, "processDescriptor"), "actor");
+    char *console = descriptor ? browser_target_console(b, descriptor, 1) : NULL;
+    cJSON_Delete(reply);
+    if (!console && !b->error[0]) err_set(b->error, sizeof(b->error), "Firefox did not return a browser console");
+    return console;
+}
+
+static char *browser_page_eval(browser_connection *b, const char *descriptor, const char *expression) {
+    char *console = browser_target_console(b, descriptor, 0);
+    char *result = console ? browser_evaluate_actor(b, console, expression) : NULL;
+    free(console);
+    return result;
+}
+
+static int browser_wait_ready(browser_connection *b, const char *descriptor, int navigated) {
+    long last_length = -1;
+    int stable = 0, saw_url = 0, iterations = navigated ? 100 : 80;
+    for (int i = 0; i < iterations; i++) {
+        if (browser_cancelled(b)) return -1;
+        char *probe = browser_page_eval(b, descriptor, navigated ?
+            "location.href+'\\n'+document.readyState+'\\n'+((document.body&&document.body.innerText)||'').length" :
+            "document.readyState");
+        if (!navigated) {
+            int ready = probe && (!strcmp(probe, "complete") || !strcmp(probe, "interactive"));
+            free(probe);
+            if (ready) return browser_sleep(b, 800);
+        } else if (probe) {
+            char *line = strchr(probe, '\n'), *length = line ? strchr(line + 1, '\n') : NULL;
+            if (line && length) {
+                *line++ = 0; *length++ = 0;
+                int real_url = *probe && strcmp(probe, "about:blank") && strncmp(probe, "chrome://", 9);
+                int ready = !strcmp(line, "complete") || !strcmp(line, "interactive");
+                long text_length = strtol(length, NULL, 10);
+                if (real_url) saw_url = 1;
+                stable = text_length > 0 && text_length == last_length ? stable + 1 : 0;
+                last_length = text_length;
+                free(probe); probe = NULL;
+                if (saw_url && ready && text_length > 0 && stable >= 2) return browser_sleep(b, 500);
+                if (saw_url && ready && i >= 24) return 0;
+            }
+            free(probe);
+        }
+        if (browser_sleep(b, 250)) return -1;
+    }
+    return 0;
+}
+
+/* These expressions only contain application code and numeric browser IDs.
+ * Site content is evaluated exclusively in the corresponding page console. */
+static const char *const BROWSER_OPEN_TAB_JS =
+    "(async()=>{let w;for(let i=0;i<80;i++){w=Services.wm.getMostRecentWindow('navigator:browser');"
+    "if(w&&w.gBrowser&&w.gBrowser.addTab)break;await new Promise(r=>setTimeout(r,250));}"
+    "if(!w||!w.gBrowser)throw Error('Firefox has no browser window');"
+    "const t=w.gBrowser.addTab('about:blank',{inBackground:true,"
+    "triggeringPrincipal:Services.scriptSecurityManager.getSystemPrincipal()});"
+    "return String(t.linkedBrowser.browserId);})()";
+
+static void browser_close_tab(const char *endpoint, long browser_id) {
+    if (browser_id <= 0) return;
+    browser_connection b = {.fd = -1, .cleanup = 1};
+    if (browser_connect(&b, endpoint)) return;
+    char *console = browser_parent_console(&b);
+    char expression[1024];
+    snprintf(expression, sizeof(expression),
+        "(()=>{const tabs=[];for(const w of Services.wm.getEnumerator('navigator:browser'))if(w.gBrowser)"
+        "for(const t of w.gBrowser.tabs)tabs.push(t);if(tabs.length<=1)return 'kept last tab';"
+        "const t=tabs.find(t=>t.linkedBrowser.browserId===%ld);"
+        "if(t)t.ownerGlobal.gBrowser.removeTab(t);return 'closed';})()", browser_id);
+    char *result = console ? browser_evaluate_actor(&b, console, expression) : NULL;
+    free(result); free(console); close(b.fd);
+}
+
+static char *browser_search_url(const char *query) {
+    sbuf url; sb_init(&url);
+    sb_puts(&url, "https://www.google.com/search?q=");
+    for (const unsigned char *p = (const unsigned char *)query; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.' || *p == '~') sb_put(&url, p, 1);
+        else sb_printf(&url, "%%%02X", *p);
+    }
+    char *result = sb_take(&url); sb_free(&url); return result;
+}
+
+static char *browser_page_result(const char *url, const char *markdown, char *err, size_t errsz) {
+    char path[] = "/tmp/oca_agent_web_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { err_set(err, errsz, "failed to create temporary file: %s", strerror(errno)); return NULL; }
+    size_t length = strlen(markdown), offset = 0;
+    while (offset < length) {
+        ssize_t n = write(fd, markdown + offset, length - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        offset += (size_t)n;
+    }
+    int failed = offset != length;
+    if (close(fd)) failed = 1;
+    if (failed) { unlink(path); err_set(err, errsz, "failed to write temporary file"); return NULL; }
+    size_t total_lines = 0, shown_lines = 0, count = 0;
+    for (size_t i = 0; i < length; i++) if (markdown[i] == '\n') total_lines++;
+    if (length && markdown[length - 1] != '\n') total_lines++;
+    while (count < length && count < BROWSER_HEAD_BYTES && shown_lines < BROWSER_HEAD_LINES)
+        if (markdown[count++] == '\n') shown_lines++;
+    /* OCA tool messages must be UTF-8; do not split a code point at 8 KiB. */
+    while (count && ((unsigned char)markdown[count] & 0xc0) == 0x80) count--;
+    int truncated = count < length;
+    sbuf result; sb_init(&result);
+    sb_printf(&result, "visit_page url=%s\noutput_path=%s (%zu bytes, %zu lines)\n", url, path, length, total_lines);
+    if (truncated) sb_printf(&result, "<head -%d %s>\n", BROWSER_HEAD_LINES, path);
+    else sb_puts(&result, "<markdown>\n");
+    sb_put(&result, markdown, count);
+    if (count && markdown[count - 1] != '\n') sb_puts(&result, "\n");
+    if (truncated) {
+        sb_puts(&result, "</head>\nUse read path=<output_path> offset=<line> limit=<count> to inspect more rendered Markdown.\n");
+    } else sb_puts(&result, "</markdown>\n");
+    char *text = sb_take(&result); sb_free(&result);
+    if (!text) { unlink(path); err_set(err, errsz, "out of memory"); }
+    return text;
+}
+
+/* Literal DOM programs from antirez/ds4 5379c1c9ac315f1540371b06a3db88491d4059ff.
+ * MIT attribution is retained in LICENSE; reference fixtures pin their behavior. */
+static const char *const BROWSER_CONSENT_JS =
+"(() => {"
+"const clean=s=>(s||'').replace(/\\s+/g,' ').trim();"
+"const pats=[/accept all/i,/i agree/i,/agree/i,/accetta tutto/i,/tout accepter/i,/aceptar todo/i,/alle akzeptieren/i];"
+"const els=[...document.querySelectorAll('button,[role=button],input[type=submit],a')];"
+"for (const el of els){const t=clean(el.innerText||el.value||el.textContent);"
+"if(!t)continue; if(pats.some(p=>p.test(t))){el.click(); return 'clicked '+t;}}"
+"return '';"
+"})()";
+
+static const char *const BROWSER_SEARCH_JS =
+"(() => {"
+"const clean=s=>(s||'').replace(/\\s+/g,' ').trim();"
+"const esc=s=>clean(s).replace(/\\\\/g,'\\\\\\\\').replace(/\\[/g,'\\\\[').replace(/\\]/g,'\\\\]').replace(/\\n/g,' ');"
+"const visible=el=>{const r=el.getBoundingClientRect();const st=getComputedStyle(el);return r.width>0&&r.height>0&&st.display!=='none'&&st.visibility!=='hidden'&&st.opacity!=='0';};"
+"const bad=h=>(/(^|\\.)google\\./.test(h)||/(^|\\.)gstatic\\./.test(h)||/(^|\\.)googleusercontent\\./.test(h));"
+"const lines=['# Google search results','',`URL: ${location.href}`,'','## Visible links'];"
+"const seen=new Set();"
+"for(const a of document.querySelectorAll('a[href]')){if(!visible(a))continue;let href=a.href||'';"
+"try{const u=new URL(href);if(u.pathname==='/url'&&u.searchParams.get('q'))href=u.searchParams.get('q');}catch{}"
+"let u;try{u=new URL(href);}catch{continue;}if(!/^https?:$/.test(u.protocol))continue;if(bad(u.hostname))continue;"
+"const text=esc(a.innerText||a.textContent);if(text.length<3)continue;if(seen.has(u.href))continue;seen.add(u.href);"
+"lines.push(`- [${text.slice(0,180)}](${u.href})`);if(seen.size>=20)break;}"
+"lines.push('','## Text snapshot',clean(document.body.innerText).slice(0,1200));"
+"return lines.join('\\n');"
+"})()";
+
+static const char *const BROWSER_PAGE_JS =
+"(() => {"
+"const clean=s=>(s||'').replace(/\\s+/g,' ').trim();"
+"const esc=s=>clean(s).replace(/\\\\/g,'\\\\\\\\').replace(/\\[/g,'\\\\[').replace(/\\]/g,'\\\\]').replace(/\\n/g,' ');"
+"const visible=el=>{const r=el.getBoundingClientRect();const st=getComputedStyle(el);return r.width>0&&r.height>0&&st.display!=='none'&&st.visibility!=='hidden'&&st.opacity!=='0';};"
+"const inline=n=>{if(!n)return'';if(n.nodeType===3)return n.nodeValue;if(n.nodeType!==1)return'';const el=n;"
+"if(el.tagName==='SCRIPT'||el.tagName==='STYLE'||el.tagName==='NOSCRIPT')return'';"
+"if(el.tagName==='A'){const t=esc(el.innerText||el.textContent);const h=el.href||'';return t&&h?`[${t}](${h})`:t;}"
+"if(el.tagName==='CODE')return '`'+clean(el.innerText||el.textContent).replace(/`/g,'\\\\`')+'`';"
+"return [...el.childNodes].map(inline).join('');};"
+"const lines=[`# ${clean(document.title)||location.href}`,'',`URL: ${location.href}`,'','## Content'];"
+"const blocks=[...document.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,td,th,[id=\"content-text\"],[class*=\"comment-body\"],[class*=\"comment-content\"],[data-testid*=\"comment-text\"]')];"
+"const seen=new Set();"
+"for(const el of blocks){if(!visible(el))continue;let s='';const tag=el.tagName;"
+"if(/^H[1-6]$/.test(tag)){s='#'.repeat(Number(tag[1]))+' '+inline(el);}"
+"else if(tag==='LI'){s='- '+inline(el);}"
+"else if(tag==='PRE'){s='```\\n'+(el.innerText||el.textContent||'').trimEnd()+'\\n```';}"
+"else if(tag==='BLOCKQUOTE'){s='> '+clean(el.innerText||el.textContent);}"
+"else{s=inline(el);}s=s.trim();if(!s||seen.has(s))continue;seen.add(s);lines.push('',s);"
+"if(lines.join('\\n').length>900000){lines.push('','[Content truncated by browser extractor.]');break;}}"
+"lines.push('','## Visible links');let n=0;const linkSeen=new Set();"
+"for(const a of document.querySelectorAll('a[href]')){if(!visible(a))continue;const t=esc(a.innerText||a.textContent);if(t.length<3)continue;"
+"let u;try{u=new URL(a.href);}catch{continue;}if(!/^https?:$/.test(u.protocol)||linkSeen.has(u.href))continue;linkSeen.add(u.href);"
+"lines.push(`- [${t.slice(0,160)}](${u.href})`);if(++n>=80)break;}"
+"return lines.join('\\n');"
+"})()";
+
+static const char *const BROWSER_SCROLL_JS =
+        "(() => new Promise(resolve => {"
+        "const root=()=>document.scrollingElement||document.documentElement||document.body;"
+        "const blockSel='h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,td,th,[id=\"content-text\"],[class*=\"comment-body\"],[class*=\"comment-content\"],[data-testid*=\"comment-text\"]';"
+        "const lazySel='[onscroll],[loading=\"lazy\"],[data-src],[data-lazy],[class*=\"lazy\"],[class*=\"infinite\"],[class*=\"virtual\"],[role=\"feed\"],[id*=\"comment\"],[class*=\"comment\"],[data-testid*=\"comment\"]';"
+        "const hookCount=()=>{let n=0;try{if(window.onscroll)n++;if(document.onscroll)n++;if(document.body&&document.body.onscroll)n++;}catch(e){}"
+        "try{if(typeof getEventListeners==='function'){for(const o of [window,document,document.body]){if(!o)continue;const ev=getEventListeners(o);if(ev&&ev.scroll)n+=ev.scroll.length;}}}catch(e){}"
+        "try{n+=document.querySelectorAll(lazySel).length;}catch(e){}return n;};"
+        "const metrics=()=>{const r=root();return {"
+        "height:r?r.scrollHeight:0,"
+        "view:innerHeight||900,"
+        "y:scrollY||(r&&r.scrollTop)||0,"
+        "text:((document.body&&document.body.innerText)||'').length,"
+        "links:document.links?document.links.length:0,"
+        "blocks:document.body?document.body.querySelectorAll(blockSel).length:0,"
+        "hooks:hookCount()};};"
+        "const sig=m=>[m.height,m.text,m.links,m.blocks].join('|');"
+        "const grew=(a,b)=>b.height>a.height+20||b.text>a.text+200||b.links>a.links+2||b.blocks>a.blocks+2;"
+        "const scrollOnce=()=>{const r=root();if(!r)return;"
+        "const h=Math.max(700,Math.floor((innerHeight||900)*0.85));"
+        "window.scrollTo(0,Math.min(r.scrollHeight,(scrollY||r.scrollTop||0)+h));};"
+        "let last=metrics(),lastSig=sig(last),same=0,steps=0;"
+        "const scrollable=last.height>last.view*1.35;"
+        "if(!scrollable||last.hooks===0){resolve('scroll skipped hooks='+last.hooks+' text='+last.text);return;}"
+        "const tick=()=>{"
+        "if(steps>=28){resolve('scrolled '+steps+' text='+last.text);return;}"
+        "const before=last;"
+        "scrollOnce();steps++;"
+        "setTimeout(()=>{const now=metrics(),nowSig=sig(now);"
+        "if(nowSig===lastSig)same++;else same=0;"
+        "const loaded=grew(before,now);"
+        "last=now;lastSig=nowSig;"
+        "if(steps===1&&!loaded){resolve('scroll probe unchanged text='+now.text);return;}"
+        "const atBottom=now.y+now.view+20>=now.height;"
+        "if(same>=4||(atBottom&&same>=1)){resolve('scrolled '+steps+' text='+now.text);return;}"
+        "tick();},900);"
+        "};tick();"
+        "}))()";
+
+
+
+static void tool_browser(const char *workspace, const char *endpoint, const char *name,
+                          const cJSON *args, tool_outcome *out) {
+    (void)workspace;
+    char err[512] = "";
+    if (browser_arguments(name, args, err, sizeof(err))) { outcome_fail(out, "Tool error: %s\n", err); return; }
+    browser_interrupt = 0;
+    struct sigaction action = {0}, previous;
+    action.sa_handler = browser_signal; sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, &previous)) { outcome_fail(out, "cannot prepare browser cancellation"); return; }
+    browser_connection b = {.fd = -1};
+    char *parent = NULL, *descriptor = NULL, *url = NULL, *markdown = NULL;
+    long browser_id = 0;
+    cJSON *reply = NULL;
+    if (browser_connect(&b, endpoint)) goto failed;
+    parent = browser_parent_console(&b);
+    if (!parent) goto failed;
+    char *id = browser_evaluate_actor(&b, parent, BROWSER_OPEN_TAB_JS);
+    if (id) {
+        char *end = NULL; browser_id = strtol(id, &end, 10);
+        if (!end || *end || browser_id <= 0) browser_id = 0;
+    }
+    free(id);
+    if (!browser_id) { if (!b.error[0]) err_set(b.error, sizeof(b.error), "Firefox did not return a page identifier"); goto failed; }
+    cJSON *p = cJSON_CreateObject();
+    if (p && !cJSON_AddNumberToObject(p, "browserId", browser_id)) { cJSON_Delete(p); p = NULL; }
+    reply = browser_command(&b, "root", "getTab", p, BROWSER_COMMAND_MS);
+    const char *actor = json_text(cJSON_GetObjectItemCaseSensitive(reply, "tab"), "actor");
+    descriptor = actor ? xstrdup(actor) : NULL;
+    cJSON_Delete(reply); reply = NULL;
+    if (!descriptor) { if (!b.error[0]) err_set(b.error, sizeof(b.error), "Firefox did not return a page descriptor"); goto failed; }
+    char prepare[1024];
+    snprintf(prepare, sizeof(prepare),
+        "(()=>{for(const w of Services.wm.getEnumerator('navigator:browser'))if(w.gBrowser)"
+        "for(const t of w.gBrowser.tabs){const b=t.linkedBrowser;if(b.browserId!==%ld)continue;"
+        "try{b.browsingContext.isActive=true;}catch{}"
+        "try{b.browsingContext.overrideDPPX=1;b.style.width='1365px';b.style.height='900px';"
+        "b.ownerDocument.synchronouslyUpdateRemoteBrowserDimensions(true);}catch{}"
+        "return 'prepared';}return 'not found';})()", browser_id);
+    char *optional = browser_evaluate_actor(&b, parent, prepare); free(optional);
+    if (browser_wait_ready(&b, descriptor, 0)) goto failed;
+    int search = !strcmp(name, "google_search");
+    url = search ? browser_search_url(json_text(args, "query")) : xstrdup(json_text(args, "url"));
+    p = url ? browser_params("url", url) : NULL;
+    if (p && !cJSON_AddBoolToObject(p, "waitForLoad", 0)) { cJSON_Delete(p); p = NULL; }
+    reply = browser_command(&b, descriptor, "navigateTo", p, BROWSER_COMMAND_MS);
+    if (!reply) goto failed;
+    cJSON_Delete(reply); reply = NULL;
+    if (browser_wait_ready(&b, descriptor, 1)) goto failed;
+    char *clicked = browser_page_eval(&b, descriptor, BROWSER_CONSENT_JS);
+    if (clicked && *clicked) {
+        if (browser_sleep(&b, 1500) || browser_wait_ready(&b, descriptor, 1)) { free(clicked); goto failed; }
+    }
+    free(clicked);
+    if (!search) {
+        char *scrolled = browser_page_eval(&b, descriptor, BROWSER_SCROLL_JS);
+        free(scrolled);
+        if (browser_cancelled(&b)) goto failed;
+    }
+    markdown = browser_page_eval(&b, descriptor, search ? BROWSER_SEARCH_JS : BROWSER_PAGE_JS);
+    if (!markdown) goto failed;
+    out->text = search ? xstrdup(markdown) : browser_page_result(url, markdown, err, sizeof(err));
+    if (!out->text) { if (!err[0]) snprintf(err, sizeof(err), "out of memory"); goto failed; }
+    out->state = OCA_TOOL_COMPLETE;
+    goto done;
+failed:
+    outcome_fail(out, "Tool error: %s failed: %s\n", name, *err ? err : *b.error ? b.error : "unknown error");
+    if (browser_interrupt) out->state = OCA_TOOL_INTERRUPTED;
+done:
+    cJSON_Delete(reply);
+    if (b.fd >= 0) close(b.fd);
+    browser_close_tab(endpoint, browser_id);
+    free(parent); free(descriptor); free(url); free(markdown);
+    sigaction(SIGTERM, &previous, NULL);
+}
+
 enum { EXEC_RUN = 2, EXEC_CANCEL = 3, EXEC_OUTPUT = 4, EXEC_RESULT = 5 };
 enum { JOB_RUNNING, JOB_CANCELLED, JOB_TIMED_OUT, JOB_FAILED, JOB_OUTPUT_LIMIT };
 #define EXEC_PACKET_MAX OCA_TOOL_OUTPUT_MAX_BYTES
@@ -3210,6 +3811,10 @@ struct oca_tool_executor {
     char *executable;       /* Owned path used to start fresh workers. */
     oca_core *progress;     /* Borrowed only for the current core tool call. */
     int ready;
+    pid_t browser_pid;       /* Only reaped if exited; Firefox outlives this executor. */
+    char *browser_profile;   /* Persistent, separate Firefox profile. */
+    char browser_endpoint[96];
+    int browser_allowed;    /* Startup approval lasts for this executor. */
 };
 
 static void executor_driver_call(oca_tool_executor *executor, const char *name,
@@ -3219,6 +3824,132 @@ static long long executor_now_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
     return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int browser_approve(oca_core *core, char *err, size_t errsz) {
+    if (!core || !core->interactive) {
+        err_set(err, errsz, "visible Firefox browser startup requires interactive approval"); return 0;
+    }
+    oca_core_event event = {.kind = OCA_CE_BROWSER_APPROVAL,
+        .text = xstrdup("The web tool wants to start a visible Firefox browser. Allow? (y/n)")};
+    if (!event.text) { err_set(err, errsz, "out of memory"); return 0; }
+    pthread_mutex_lock(&core->mu);
+    core->browser_approval_waiting = 1;
+    core->browser_approval_answer = -1;
+    pthread_mutex_unlock(&core->mu);
+    set_state(core, OCA_S_WAITING_USER);
+    ev_push(core, &event);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += BROWSER_APPROVAL_SECONDS;
+    pthread_mutex_lock(&core->mu);
+    int timed_out = 0;
+    while (core->browser_approval_answer < 0 && atomic_load(&core->running) &&
+           !atomic_load(&core->cancel_latch)) {
+        int rc = pthread_cond_timedwait(&core->cond, &core->mu, &deadline);
+        if (rc == ETIMEDOUT) { timed_out = 1; break; }
+        if (rc) break;
+    }
+    int interrupted = !atomic_load(&core->running) || atomic_load(&core->cancel_latch);
+    int allowed = core->browser_approval_answer == 1 && !interrupted && !timed_out;
+    core->browser_approval_waiting = 0;
+    pthread_mutex_unlock(&core->mu);
+    event = (oca_core_event){.kind = OCA_CE_BROWSER_APPROVAL};
+    ev_push(core, &event);
+    set_state(core, OCA_S_RUNNING_TOOL);
+    if (!allowed) err_set(err, errsz, "%s", interrupted ? "interrupted" : timed_out ?
+        "Firefox browser start approval timed out" : "user denied Firefox browser start");
+    return allowed;
+}
+
+static void browser_reap(oca_tool_executor *executor) {
+    if (executor->browser_pid <= 0) return;
+    pid_t result = waitpid(executor->browser_pid, NULL, WNOHANG);
+    if (result == executor->browser_pid || (result < 0 && errno == ECHILD)) executor->browser_pid = 0;
+}
+
+static int browser_alive(const char *endpoint, const atomic_int *cancel) {
+    browser_connection b = {.fd = -1, .cancel = cancel};
+    if (browser_connect(&b, endpoint)) return 0;
+    close(b.fd);
+    return 1;
+}
+
+static int browser_start(oca_tool_executor *executor, const atomic_int *cancel, tool_outcome *out) {
+    if (cancel && atomic_load(cancel)) goto cancelled;
+    browser_reap(executor);
+    if (browser_alive(executor->browser_endpoint, cancel)) return 0;
+    if (cancel && atomic_load(cancel)) goto cancelled;
+    char err[512] = "";
+    if (!executor->browser_allowed) {
+        if (!browser_approve(executor->progress, err, sizeof(err))) {
+            if (cancel && atomic_load(cancel)) goto cancelled;
+            outcome_fail(out, "%s", err); return -1;
+        }
+        executor->browser_allowed = 1;
+    }
+    if (cancel && atomic_load(cancel)) goto cancelled;
+    if (!executor->browser_profile) executor->browser_profile = path_join_alloc(executor->home, ".oca/browser");
+    char *preferences = executor->browser_profile ? path_join_alloc(executor->browser_profile, "user.js") : NULL;
+    if (!preferences || mkdir_parents_0700(preferences, err, sizeof(err))) {
+        free(preferences); outcome_fail(out, "failed to create Firefox profile: %s", *err ? err : "out of memory"); return -1;
+    }
+    /* Configure only OCA's dedicated profile. These correspond to Chrome's
+     * DevTools, no-first-run, no-default-browser-check, disable-sync and mute
+     * startup options. Existing profile preferences are not overwritten. */
+    if (access(preferences, F_OK) && errno == ENOENT) {
+        const char *defaults =
+            "user_pref(\"devtools.debugger.remote-enabled\", true);\n"
+            "user_pref(\"devtools.chrome.enabled\", true);\n"
+            "user_pref(\"devtools.debugger.prompt-connection\", false);\n"
+            "user_pref(\"devtools.debugger.force-local\", true);\n"
+            "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
+            "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
+            "user_pref(\"identity.fxaccounts.enabled\", false);\n"
+            "user_pref(\"media.volume_scale\", \"0.0\");\n";
+        if (write_file_atomic_0600(preferences, defaults, strlen(defaults), err, sizeof(err))) {
+            free(preferences); outcome_fail(out, "failed to prepare Firefox profile: %s", err); return -1;
+        }
+    }
+    free(preferences);
+    const char *binary = getenv("OCA_FIREFOX");
+    if (!binary || !*binary) binary = "firefox";
+    char port[16];
+    snprintf(port, sizeof(port), "%d", browser_endpoint_port(executor->browser_endpoint));
+    char *argv[] = {(char *)binary, "--no-remote", "--profile", executor->browser_profile,
+        "--start-debugger-server", port, "about:blank", NULL};
+    int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0) { outcome_fail(out, "failed to prepare Firefox startup"); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) { close(null_fd); outcome_fail(out, "failed to fork Firefox: %s", strerror(errno)); return -1; }
+    if (!pid) {
+        if (setsid() < 0 || dup2(null_fd, 0) < 0 || dup2(null_fd, 1) < 0 || dup2(null_fd, 2) < 0) _exit(127);
+        for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_SETFD, 0)) _exit(127);
+#if defined(__linux__) && defined(SYS_close_range)
+        (void)syscall(SYS_close_range, 3u, ~0u, 4u);
+#endif
+        execvp(binary, argv);
+        _exit(127);
+    }
+    close(null_fd);
+    executor->browser_pid = pid;
+    browser_connection delay = {.fd = -1, .cancel = cancel};
+    for (int i = 0; i < 80; i++) {
+        if (cancel && atomic_load(cancel)) goto cancelled;
+        if (browser_alive(executor->browser_endpoint, cancel)) return 0;
+        if (cancel && atomic_load(cancel)) goto cancelled;
+        browser_reap(executor);
+        if (!executor->browser_pid) {
+            outcome_fail(out, "Firefox exited before DevTools became ready. Check OCA_FIREFOX and the display."); return -1;
+        }
+        if (browser_sleep(&delay, 250)) goto cancelled;
+    }
+    outcome_fail(out, "Firefox did not expose DevTools on port %s", port);
+    return -1;
+cancelled:
+    out->state = OCA_TOOL_INTERRUPTED;
+    out->text = xstrdup("interrupted");
+    return -1;
 }
 
 static int executor_socket_pair(int pair[2]) {
@@ -3348,11 +4079,12 @@ static int executor_high_fd(int fd) {
     return copy;
 }
 
-static void executor_native(const char *workspace, const char *name,
+static void executor_native(const char *workspace, const char *endpoint, const char *name,
                              const cJSON *args, tool_outcome *out) {
     if (!strcmp(name, "read")) tool_read(workspace, args, out);
     else if (!strcmp(name, "write")) tool_write(workspace, args, out);
     else if (!strcmp(name, "edit")) tool_edit(workspace, args, out);
+    else if (browser_tool(name)) tool_browser(workspace, endpoint, name, args, out);
     else outcome_fail(out, "unknown filesystem tool");
 }
 
@@ -3398,7 +4130,7 @@ static void executor_collect(sbuf *buffer, int fd, size_t cap, int *truncated) {
     sb_put(buffer, data, amount);
 }
 
-static void executor_job(int channel, uint32_t sequence, const char *workspace,
+static void executor_job(int channel, uint32_t sequence, const char *workspace, const char *endpoint,
                          const char *name, const cJSON *args, tool_outcome *out) {
     int pair[2];
     if (executor_socket_pair(pair)) {
@@ -3434,7 +4166,7 @@ static void executor_job(int channel, uint32_t sequence, const char *workspace,
             _exit(127);
         }
         tool_outcome result = {0};
-        executor_native(workspace, name, args, &result);
+        executor_native(workspace, endpoint, name, args, &result);
         const char *text = result.text ? result.text : "tool process failed";
         int rc = executor_send(pair[1], EXEC_RESULT, sequence, result.state, text, strlen(text));
         free(result.text);
@@ -3552,6 +4284,9 @@ void oca_tool_executor_destroy(oca_tool_executor *executor) {
         free(executor);
         return;
     }
+    /* Like ds4, release the controller without closing the browser or profile. */
+    browser_reap(executor);
+    free(executor->browser_profile);
     free(executor->home);
     free(executor->workspace);
     free(executor->executable);
@@ -3564,6 +4299,23 @@ static void executor_call(oca_tool_executor *executor, const char *workspace,
         outcome_fail(out, "the tool executor is unavailable for this workspace");
         return;
     }
+    if (browser_tool(name)) {
+        const char *why = NULL;
+        cJSON *args = json_parse(json, strlen(json), &why);
+        char err[256];
+        int valid = args && cJSON_IsObject(args) && !browser_arguments(name, args, err, sizeof(err));
+        cJSON_Delete(args);
+        if (!valid) { outcome_fail(out, "Invalid browser arguments"); return; }
+        if (browser_start(executor, cancel, out)) {
+            char *detail = out->text;
+            int state = out->state;
+            out->text = NULL;
+            outcome_fail(out, "Tool error: %s failed: %s\n", name, detail ? detail : "unknown error");
+            out->state = state;
+            free(detail);
+            return;
+        }
+    }
     executor_driver_call(executor, name, json, cancel, out);
 }
 
@@ -3573,6 +4325,7 @@ static char *executor_bootstrap(const oca_tool_executor *executor, const char *n
     int valid = root && cJSON_AddStringToObject(root, "workspace", executor->workspace) &&
         cJSON_AddStringToObject(root, "name", name) &&
         cJSON_AddStringToObject(root, "args", json);
+    if (valid && browser_tool(name)) valid = cJSON_AddStringToObject(root, "browser", executor->browser_endpoint) != NULL;
     char *text = valid ? cJSON_PrintUnformatted(root) : NULL;
     cJSON_Delete(root);
     if (text && strlen(text) > EXEC_BOOT_MAX) {
@@ -3596,7 +4349,7 @@ static cJSON *executor_bootstrap_decode(const char *text, size_t length,
     }
     const char *end = NULL;
     cJSON *root = cJSON_ParseWithLengthOpts(text, length + 1, &end, 1);
-    if (!cJSON_IsObject(root) || cJSON_GetArraySize(root) != 3 || end != text + length) {
+    if (!cJSON_IsObject(root) || (cJSON_GetArraySize(root) != 3 && cJSON_GetArraySize(root) != 4) || end != text + length) {
         cJSON_Delete(root);
         goto invalid;
     }
@@ -3614,6 +4367,12 @@ static cJSON *executor_bootstrap_decode(const char *text, size_t length,
     *workspace = directory->valuestring;
     *name = operation->valuestring;
     *arguments = values->valuestring;
+    const cJSON *browser = cJSON_GetObjectItemCaseSensitive(root, "browser");
+    if (browser_tool(*name)) {
+        if (!cJSON_IsString(browser) || !browser_endpoint_port(browser->valuestring) || cJSON_GetArraySize(root) != 4) {
+            cJSON_Delete(root); goto invalid;
+        }
+    } else if (cJSON_GetArraySize(root) != 3) { cJSON_Delete(root); goto invalid; }
     return root;
 invalid:
     err_set(err, errsz, "tool request rejected");
@@ -3642,14 +4401,15 @@ int oca_tool_worker_main(void) {
         return 125;
     }
     const char *why = NULL;
+    const char *endpoint = json_text(document, "browser");
     cJSON *args = json_parse(arguments, strlen(arguments), &why);
     tool_outcome out = {0};
     if (!strcmp(name, "probe") && args && cJSON_IsObject(args)) {
         out.text = xstrdup("Executor ready.");
         out.state = OCA_TOOL_COMPLETE;
     } else if ((!strcmp(name, "read") || !strcmp(name, "write") || !strcmp(name, "edit") ||
-        !strcmp(name, "bash")) && args && cJSON_IsObject(args)) {
-        executor_job(3, packet.sequence, workspace, name, args, &out);
+        !strcmp(name, "bash") || browser_tool(name)) && args && cJSON_IsObject(args)) {
+        executor_job(3, packet.sequence, workspace, endpoint, name, args, &out);
     } else outcome_fail(&out, "tool request rejected");
     cJSON_Delete(args);
     cJSON_Delete(document);
@@ -3831,6 +4591,7 @@ oca_tool_executor *oca_tool_executor_create(const char *home, const char *worksp
     executor->home = realpath(home, NULL);
     executor->workspace = realpath(workspace, NULL);
     executor->executable = executor_path_alloc();
+    snprintf(executor->browser_endpoint, sizeof(executor->browser_endpoint), "127.0.0.1:%d", BROWSER_DEFAULT_PORT);
     struct stat state;
     if (!executor->home || !executor->workspace || !executor->executable ||
         stat(executor->home, &state) || !S_ISDIR(state.st_mode) ||
@@ -4210,6 +4971,8 @@ static int validate_call(oca_core *c, const char *name, const char *args_json,
             goto out;
         }
         rc = 0;
+    } else if (browser_tool(name)) {
+        rc = browser_arguments(name, args, why, whysz);
     } else if (strcmp(name, "ask_user") == 0) {
         if (!c->interactive) {
             snprintf(why, whysz, "ask_user is not available in this run");
@@ -4392,7 +5155,7 @@ static void run_tool_call(oca_core *c, const char *name, const char *args_json,
         return;
     }
     if (c->executor && (!strcmp(name, "read") || !strcmp(name, "write") ||
-        !strcmp(name, "edit") || !strcmp(name, "bash"))) {
+        !strcmp(name, "edit") || !strcmp(name, "bash") || browser_tool(name))) {
         c->executor->progress = c;
         executor_call(c->executor, c->workspace, name, args_json, &c->cancel_latch, o);
         c->executor->progress = NULL;
@@ -5915,6 +6678,19 @@ int oca_core_submit_answers(oca_core *c, const char *answers_json, char *err, si
     c->ia_answers_json = copy;
     pthread_mutex_unlock(&c->mu);
     pthread_cond_broadcast(&c->cond);
+    return 0;
+}
+
+int oca_core_browser_answer(oca_core *c, int allow, char *err, size_t errsz) {
+    pthread_mutex_lock(&c->mu);
+    if ((allow != 0 && allow != 1) || !c->browser_approval_waiting ||
+        c->browser_approval_answer >= 0 || atomic_load(&c->cancel_latch) || !atomic_load(&c->running)) {
+        pthread_mutex_unlock(&c->mu);
+        err_set(err, errsz, "no browser startup approval is waiting"); return -1;
+    }
+    c->browser_approval_answer = allow;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->mu);
     return 0;
 }
 

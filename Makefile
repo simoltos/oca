@@ -7,7 +7,7 @@ MANUAL_FILES = SKILL.md references/commands.md references/interactive.md referen
 
 SOURCES = oca.c oca_core.c oca_llm.c oca_tui.c
 OBJECTS = $(SOURCES:.c=.o)
-TESTS = tests/test_llm tests/test_core tests/test_cli tests/test_tui tests/test_kimi tests/test_config tests/test_executor tests/test_login tests/test_providers tests/test_compaction tests/test_transcript tests/test_tui_core tests/test_ephemeral
+TESTS = tests/test_llm tests/test_core tests/test_cli tests/test_tui tests/test_kimi tests/test_config tests/test_executor tests/test_browser tests/test_login tests/test_providers tests/test_compaction tests/test_transcript tests/test_tui_core tests/test_ephemeral
 TEST_OBJECTS = $(TESTS:%=%.o)
 
 .PHONY: all install test sanitize clean
@@ -122,14 +122,22 @@ tests/test_config: tests/test_config.o oca_core.o oca_llm.o oca_tui.o
 tests/test_executor: tests/test_executor.c oca_core.c oca_core.h oca_llm.c oca_llm.h tests/fixture_llm.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -o $@ tests/test_executor.c tests/fixture_llm.c $(LDLIBS)
 
+tests/test_browser: tests/test_browser.c oca_core.c oca_core.h oca_llm.c oca_llm.h tests/fixture_llm.c tests/fixture_models.h tests/fixture_server.c tests/fixture_server.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -o $@ tests/test_browser.c tests/fixture_llm.c tests/fixture_server.c $(LDLIBS)
+
 tests/oca_core_fixture.o: oca_core.c oca_core.h oca_llm.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -c -o $@ $<
 
 tests/oca-fixture: oca.o tests/oca_core_fixture.o tests/fixture_llm.o oca_tui.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/fixture_browser_core.o: tests/fixture_browser_core.c oca_core.c oca_core.h oca_llm.h
+
+tests/oca-browser-fixture: oca.o tests/fixture_browser_core.o tests/fixture_llm.o oca_tui.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
 # Ordinary tests run real tool workers and local provider fixtures.
-test: oca tests/oca-fixture $(TESTS)
+test: oca tests/oca-fixture tests/oca-browser-fixture $(TESTS)
 	./tests/test_llm
 	./tests/test_core
 	./tests/test_cli ./tests/oca-fixture ./oca
@@ -137,6 +145,8 @@ test: oca tests/oca-fixture $(TESTS)
 	./tests/test_kimi
 	./tests/test_config
 	./tests/test_executor ./tests/test_executor
+	./tests/test_browser
+	./tests/test_browser --tui ./tests/oca-browser-fixture
 	./tests/test_login ./tests/oca-fixture
 	./tests/test_providers
 	./tests/test_compaction
@@ -159,7 +169,7 @@ sanitize:
 # ============================================================================
 
 clean:
-	rm -f oca $(OBJECTS) $(TEST_OBJECTS) $(TESTS) tests/oca tests/oca-fixture tests/oca_core_fixture.o tests/fixture_llm.o tests/fixture_server.o tests/compaction_llm.o
+	rm -f oca $(OBJECTS) $(TEST_OBJECTS) $(TESTS) tests/oca tests/oca-fixture tests/oca-browser-fixture tests/oca_core_fixture.o tests/fixture_browser_core.o tests/fixture_llm.o tests/fixture_server.o tests/compaction_llm.o
 
 # ============================================================================
 # Dependencies

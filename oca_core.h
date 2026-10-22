@@ -85,6 +85,8 @@ typedef struct oca_core oca_core;
  * inherit the environment and ordinary filesystem and network access. They
  * keep bounded output, cancellation, process-group cleanup, and independent
  * process state. One executor serves one runtime core.
+ * Browser workers attach to Firefox DevTools. The dedicated browser and its
+ * profile persist across executor destruction and OCA invocations.
  * ========================================================================== */
 
 #define OCA_TOOL_PATH_MAX 4096
@@ -149,7 +151,7 @@ typedef struct {
  * A NULL model selects the resumed route or saved preference; with no usable
  * selection the core starts without a route.
  * A NULL route skips preference persistence. An executor can serve only one core.
- * Runtime cores without an executor reject filesystem and Bash tools.
+ * Runtime cores without an executor reject filesystem, Bash, and browser tools.
  * Session selection rebinds the executor to the saved workspace.
  * Destroy any ephemeral child first. Polled events retain their own data until release. */
 oca_core *oca_core_create(oca_llm *llm, const oca_core_options *options,
@@ -253,6 +255,9 @@ int oca_core_set_route(oca_core *core, const char *model_id_or_alias,
 int oca_core_submit_answers(oca_core *core, const char *answers_json,
                             char *err, size_t errsz);
 
+/* Answer the pending visible-browser startup prompt (0=no, 1=yes). */
+int oca_core_browser_answer(oca_core *core, int allow, char *err, size_t errsz);
+
 /* SHOW immediately queues a snapshot event without entering model context or
  * waiting for the worker. Mutating goal commands run through the action queue. */
 int oca_core_goal(oca_core *core, int goal_cmd, const char *objective,
@@ -316,7 +321,8 @@ typedef enum {
     OCA_CE_SESSION,          /* session replaced, resumed, or saved */
     OCA_CE_QUIT_OK,          /* worker completed shutdown */
     OCA_CE_USER_TEXT,        /* text: a delivered or replayed user prompt */
-    OCA_CE_TRANSCRIPT        /* entries: one owned, ordered replay batch */
+    OCA_CE_TRANSCRIPT,       /* entries: one owned, ordered replay batch */
+    OCA_CE_BROWSER_APPROVAL  /* text: prompt; NULL dismisses the prompt */
 } oca_core_event_kind;
 
 typedef struct {

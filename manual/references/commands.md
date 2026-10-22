@@ -195,7 +195,7 @@ below. An explicit `true` shows that content; `false` hides it.
 | Field | Default | Content |
 | --- | --- | --- |
 | `reasoning` | `true` | Provider-exposed reasoning in gray italic text, when available. |
-| `read` | `false` | Read results, including skill instructions and references. |
+| `read` | `false` | File reads and browser results, including skill instructions and references. |
 | `write` | `true` | Changes produced by file creation or replacement. |
 | `edit` | `true` | Changes produced by edits. |
 | `bash` | `true` | Command output, including live streaming. |
@@ -242,6 +242,10 @@ bounds, timeouts, cancellation, and worker cleanup remain active.
 
 Tools use the actual system `/tmp` and any configured `$TMPDIR`. Files created
 by tools remain ordinary host files; OCA does not remove them at shutdown.
+The dedicated Firefox profile at `~/.oca/browser` persists, and OCA leaves the
+browser running at shutdown. Page extracts use `/tmp/oca_agent_web_XXXXXX`.
+See [browser tools](conversations.md#tools) for Firefox requirements, environment
+settings, and extraction limits.
 
 ## State Files and Diagnostics
 
@@ -253,6 +257,7 @@ by tools remain ordinary host files; OCA does not remove them at shutdown.
 | `sessions/` | Explicitly saved conversations. |
 | `history` | Submitted prompt history. |
 | `skills/` | Installed instruction packages. |
+| `browser/` | Persistent, dedicated Firefox profile used by web tools. |
 | `diagnose/` | Diagnostic files created with `--diagnose`. |
 
 Diagnostic files can include prompts, tool arguments, results, and workspace

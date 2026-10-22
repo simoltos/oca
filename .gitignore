@@ -1,7 +1,9 @@
 oca
 *.o
 tests/test_*
+!tests/test_*.c
 tests/oca-fixture
+tests/oca-browser-fixture
 tests/sandbox-kernel-worker
 TODO.md
 misc/

@@ -100,12 +100,17 @@ details as the tool result. Work waits for the complete answer set.
 
 ## Tool Output and Markdown
 
+Starting the dedicated Firefox browser requires a `y`/`n` answer, with automatic
+denial after 30 seconds. An already running browser is reused without a startup
+prompt. The composer draft is retained while this prompt is displayed.
+
 Startup `show` preferences control result bodies. Reasoning, write/edit changes,
-and Bash output are visible by default; read bodies are hidden by default. Settings apply to the main chat, temporary views, manual
+and Bash output are visible by default; file-read and browser-result bodies are
+hidden by default. Settings apply to the main chat, temporary views, manual
 Bash, and saved-session replay. Ctrl+O has no output-expansion action.
 The model and saved conversation retain complete results regardless of display.
 
-Lowercase tool labels, paths, change counts, and concise failure or interruption
+Lowercase tool labels, paths, search queries, URLs, change counts, and concise failure or interruption
 states remain visible. Hidden bodies do not appear inside failure headers.
 Questions and goal notices remain usable independently of body settings.
 

@@ -75,8 +75,18 @@ typedef enum {
     MENU_HELP,
     MENU_INTERACTION,
     MENU_SAVE,
-    MENU_SAVE_CONTINUE
+    MENU_SAVE_CONTINUE,
+    MENU_BROWSER
 } menu_kind;
+
+static int menu_yes_no(menu_kind menu) {
+    return menu == MENU_SAVE || menu == MENU_SAVE_CONTINUE || menu == MENU_BROWSER;
+}
+
+static const char *yes_no_question(menu_kind menu) {
+    if (menu == MENU_BROWSER) return "The web tool wants to start a visible Firefox browser. Allow?";
+    return menu == MENU_SAVE ? "Save current session?" : "Continue anyway?";
+}
 
 typedef enum {
     CONVERSATION_NONE,
@@ -180,6 +190,7 @@ struct tui_app {
     int vertical_move;
     char save_input[16];
     size_t save_input_len;
+    long long browser_approval_deadline_ms;
     char escape[ESCAPE_MAX];
     size_t escape_len;
     long long escape_deadline_ms;
@@ -2087,13 +2098,17 @@ static void overlay_history(tui_app *app, display_lines *page, size_t rows) {
 
 static void build_composer(tui_app *app, display_lines *composer, int content_cols,
                             int *cursor_row, int *cursor_col) {
-    int save_question = app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE;
+    int save_question = menu_yes_no(app->menu);
     const char *input_style = app->invalid_input ? STYLE_DANGER :
                               app->input_len ? STYLE_RESET : STYLE_SUBTLE;
     if (save_question) {
-        char question[96];
-        snprintf(question, sizeof(question), "%s (y/n) %s",
-                 app->menu == MENU_SAVE ? "Save current session?" : "Continue anyway?", app->save_input);
+        char question[192], timeout[48] = "";
+        if (app->menu == MENU_BROWSER) {
+            long long left = app->browser_approval_deadline_ms - monotonic_ms();
+            snprintf(timeout, sizeof(timeout), " [auto-no in %llds]", left > 0 ? (left + 999) / 1000 : 0);
+        }
+        snprintf(question, sizeof(question), "%s (y/n)%s %s", yes_no_question(app->menu),
+                 timeout, app->save_input);
         lines_wrap(composer, STYLE_RESET, "", question, content_cols,
                    strlen(question), cursor_row, cursor_col);
     } else composer_wrap(app, composer, input_style, content_cols, cursor_row, cursor_col);
@@ -2219,7 +2234,7 @@ static void render_block(tui_app *app) {
         lines_free(&preview_rows);
         char legend[192];
         int remove_available = !app->input_len && !app->side_chat &&
-                               app->menu != MENU_SAVE && app->menu != MENU_SAVE_CONTINUE;
+                               !menu_yes_no(app->menu);
         snprintf(legend, sizeof(legend),
                  STYLE_INLINE "Esc" STYLE_MUTED ": %s%s"
                  STYLE_INLINE "Ctrl+X" STYLE_MUTED ": %s%s%s",
@@ -2247,7 +2262,7 @@ static void render_block(tui_app *app) {
     int status_rows = app->rows >= 2 ? 1 : 0;
     int notice_rows = notice && app->rows >= 3 && (!question || app->notice[0]) ? 1 : 0;
     size_t available = (size_t)(app->rows - status_rows - notice_rows);
-    int save_question = app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE;
+    int save_question = menu_yes_no(app->menu);
     int border = !question && !save_question && app->cols >= 8 && available >= 3;
     int content_cols = app->cols - (border ? 4 : 0);
     display_lines composer = {0};
@@ -2505,7 +2520,8 @@ static void append_change_counts(text_buffer *buffer, const char *result) {
 }
 
 static int tool_body_visible(const tui_app *app, const char *name) {
-    if (!strcmp(name, "read")) return app->display.show_read;
+    if (!strcmp(name, "read") || !strcmp(name, "google_search") || !strcmp(name, "visit_page"))
+        return app->display.show_read;
     if (!strcmp(name, "write")) return app->display.show_write;
     if (!strcmp(name, "edit")) return app->display.show_edit;
     if (!strcmp(name, "bash")) return app->display.show_bash;
@@ -2569,7 +2585,9 @@ static void tool_action_lines(tui_app *app, display_lines *lines, int state, con
     if (bracketed) buffer_append(&row, "[", 1);
     buffer_append(&row, label, strlen(label));
     if (bracketed) buffer_append(&row, "]", 1);
-    const char *key = !strcmp(name, "bash") ? "command" : "path";
+    const char *key = !strcmp(name, "bash") ? "command" :
+                      !strcmp(name, "google_search") ? "query" :
+                      !strcmp(name, "visit_page") ? "url" : "path";
     const char *value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(args, key));
     if (value) { buffer_append(&row, " ", 1); buffer_append(&row, value, strlen(value)); }
     if (!strcmp(name, "read")) {
@@ -3631,6 +3649,16 @@ static void handle_event(tui_app *app, oca_core_event *event) {
         menu_clear(app);
         app->menu = MENU_SAVE_CONTINUE;
         break;
+    case OCA_CE_BROWSER_APPROVAL:
+        if (event->text) {
+            menu_clear(app);
+            app->menu = MENU_BROWSER;
+            app->browser_approval_deadline_ms = monotonic_ms() + 30000;
+        } else {
+            if (app->menu == MENU_BROWSER) menu_clear(app);
+            app->browser_approval_deadline_ms = 0;
+        }
+        break;
     case OCA_CE_ERROR:
         stream_commit(app, 1);
         if (event->name && !strcmp(event->name, "diagnostic_failed")) app->failed = 1;
@@ -4038,7 +4066,7 @@ static int escape_prefix(const char *text, size_t len) {
 static int escape_action(tui_app *app) {
     const char *sequence = app->escape;
     if (!escape_match(sequence, strlen(sequence), 1)) return 0;
-    if ((app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE) &&
+    if ((menu_yes_no(app->menu)) &&
         strcmp(sequence, "\x1b[200~") && strcmp(sequence, "\x1b[201~")) return 1;
     if (strcmp(sequence, "\x1b[A") && strcmp(sequence, "\x1b[B")) app->vertical_move = 0;
     if (!strcmp(sequence, "\x1b[47;5u")) {
@@ -4109,7 +4137,7 @@ static int escape_action(tui_app *app) {
 }
 
 static void plain_escape(tui_app *app) {
-    if (app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE) {
+    if (menu_yes_no(app->menu)) {
         oca_core_cancel(app->core);
         menu_clear(app);
         app->notice[0] = 0;
@@ -4182,7 +4210,7 @@ static void paste_finish(tui_app *app) {
         !utf8_bytes_valid(app->paste_text ? app->paste_text : "", app->paste_text_len))
         app->paste_rejected = 2;
     if (!app->paste_rejected && app->paste_text_len) {
-        if (app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE) {
+        if (menu_yes_no(app->menu)) {
             for (size_t i = 0; i < app->paste_text_len && app->save_input_len + 1 < sizeof(app->save_input); i++) {
                 unsigned char byte = (unsigned char)app->paste_text[i];
                 app->save_input[app->save_input_len++] = byte >= 0x20 && byte < 0x7f ? (char)byte : '?';
@@ -4283,9 +4311,9 @@ static void feed_escape(tui_app *app, unsigned char byte) {
 
 
 static void exit_control(tui_app *app, int key) {
-    if (key == 4 && (app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE ||
+    if (key == 4 && (menu_yes_no(app->menu) ||
                      app->menu == MENU_INTERACTION)) return;
-    if (key == 3 && app->menu != MENU_SAVE && app->menu != MENU_SAVE_CONTINUE &&
+    if (key == 3 && !menu_yes_no(app->menu) &&
         app->menu != MENU_INTERACTION) {
         oca_core_status status;
         oca_core_get_status(app->core, &status);
@@ -4309,7 +4337,7 @@ static void exit_control(tui_app *app, int key) {
         if (busy) return;
     }
     if (app->menu == MENU_HELP || app->menu == MENU_SKILLS || app->menu == MENU_COMMANDS) menu_clear(app);
-    if (app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE) {
+    if (menu_yes_no(app->menu)) {
         oca_core_cancel(app->core);
         menu_clear(app);
         return;
@@ -4377,19 +4405,23 @@ static void handle_byte(tui_app *app, unsigned char byte) {
     }
     if (app->menu == MENU_INTERACTION && !app->interaction_details &&
         byte != '\r' && byte != 0x03 && byte != 0x04 && byte != 0x1f) return;
-    if (app->menu == MENU_SAVE || app->menu == MENU_SAVE_CONTINUE) {
+    if (menu_yes_no(app->menu)) {
         if (byte == 0x03) {
             plain_escape(app);
         } else if (byte == '\r') {
-            if (app->save_input_len == 1 && strchr("yYnN", app->save_input[0])) {
-                int answer = app->save_input[0] == 'y' || app->save_input[0] == 'Y';
-                char question[96], err[256];
-                snprintf(question, sizeof(question), "%s (y/n) %s",
-                         app->menu == MENU_SAVE ? "Save current session?" : "Continue anyway?", app->save_input);
+            const char *choice = app->save_input;
+            if (app->menu == MENU_BROWSER) while (*choice == ' ' || *choice == '\t') choice++;
+            if ((app->menu == MENU_BROWSER || app->save_input_len == 1) && *choice && strchr("yYnN", *choice)) {
+                int answer = *choice == 'y' || *choice == 'Y';
+                int browser = app->menu == MENU_BROWSER;
+                char question[192], err[256];
+                snprintf(question, sizeof(question), "%s (y/n) %s", yes_no_question(app->menu), app->save_input);
                 app->notice[0] = 0;
                 transcript_literal(app, STYLE_RESET, question, 1);
                 menu_clear(app);
-                report_action_error(app, oca_core_save_answer(app->core, answer, err, sizeof(err)), err);
+                int rc = browser ? oca_core_browser_answer(app->core, answer, err, sizeof(err)) :
+                                   oca_core_save_answer(app->core, answer, err, sizeof(err));
+                report_action_error(app, rc, err);
             } else {
                 app->save_input[0] = 0;
                 app->save_input_len = 0;

@@ -15,6 +15,12 @@ prefix; the executable goes in `PREFIX/bin`. The [manual](manual/SKILL.md) is al
 installed by that command as a skill in `~/.oca/skills/oca-manual`.
 If it's alredy present, it is updated when needed.
 
+The `google_search` and `visit_page` tools use Firefox 140 or newer through its
+native DevTools protocol. They follow ds4's browser workflow: visible browsing,
+a persistent dedicated profile, and a browser that remains open when OCA exits.
+`OCA_FIREFOX` selects the executable. See the [tool documentation](manual/references/conversations.md#tools)
+for startup approval, output limits, and the pinned upstream reference.
+
 ## Models and aliases
 
 The model catalog is built into OCA and updating the executable updates its model
