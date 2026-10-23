@@ -1775,8 +1775,12 @@ static void test_new_controls(const char *executable) {
         free(previous);
     }
     app_resize(&run, 12, 20);
-    assert(app_wait_current(&run, " queued: queued-firs", 3000));
     assert(app_wait_current(&run, " Esc: interrupt/send", 3000));
+    int narrow_preview = vt_find_row(&run.terminal, "queued:");
+    assert(narrow_preview >= 0);
+    queued_line = vt_row_copy(&run.terminal, narrow_preview);
+    assert(!strcmp(queued_line, " queued:"));
+    free(queued_line);
     queue_legend = vt_row_copy(&run.terminal, vt_find_row(&run.terminal, "Ctrl+X: edit"));
     assert(queue_legend[0] == ' ' && queue_legend[1] == 'C');
     free(queue_legend);

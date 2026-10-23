@@ -1678,6 +1678,9 @@ static void conversation_wrap(display_lines *lines, conversation_kind kind, int 
         if (*current_style) buffer_append(&line, current_style, strlen(current_style));
         int row_continued = continued;
         int column = prefix_cols;
+        int has_word = 0;
+        size_t break_at = 0, break_line = 0;
+        char break_style[48] = "";
         while (at < length && text[at] != '\n') {
             size_t style_length = sgr_length(text + at);
             if (style_length) {
@@ -1689,13 +1692,47 @@ static void conversation_wrap(display_lines *lines, conversation_kind kind, int 
             }
             size_t end = next_grapheme(text, length, at);
             int width = grapheme_columns(text + at, end - at);
-            if (column > prefix_cols && column + width > cols) break;
+            if (column > prefix_cols && column + width > cols) {
+                /* Wrap at the last space rather than splitting a word. The
+                 * space stays in this row and the word is read again from
+                 * the source, so physical rows still rejoin exactly. A word
+                 * too long for a fresh row would split anyway: keep filling
+                 * this row instead of leaving a gap. */
+                if (break_at) {
+                    int word_width = 0;
+                    for (size_t scan = break_at; scan < length &&
+                         text[scan] != '\n' && text[scan] != ' ';) {
+                        size_t skip = sgr_length(text + scan);
+                        if (skip) scan += skip;
+                        else {
+                            size_t word_end = next_grapheme(text, length, scan);
+                            word_width += grapheme_columns(text + scan, word_end - scan);
+                            scan = word_end;
+                        }
+                    }
+                    if (word_width <= cols - prefix_cols) {
+                        line.length = break_line;
+                        line.data[line.length] = 0;
+                        strcpy(current_style, break_style);
+                        at = break_at;
+                    }
+                }
+                break;
+            }
             if (width > cols - prefix_cols) {
                 buffer_append(&line, "?", 1);
                 column++;
+                has_word = 1;
             } else {
                 buffer_append(&line, text + at, end - at);
                 column += width;
+                if (text[at] == ' ') {
+                    if (has_word) {
+                        break_at = end;
+                        break_line = line.length;
+                        strcpy(break_style, current_style);
+                    }
+                } else has_word = 1;
             }
             at = end;
         }

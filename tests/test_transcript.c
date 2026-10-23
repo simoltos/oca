@@ -13,6 +13,31 @@ static void test_wrapping(void) {
     assert(lines.items[0].source_end == 7 && lines.items[1].source_end == 8);
     lines_free(&lines);
 
+    /* Words move to the next row instead of splitting at the column edge. */
+    conversation_wrap(&lines, CONVERSATION_ASSISTANT, 0, "hello world", 8);
+    assert(lines.count == 2);
+    assert(!strcmp(lines.items[0].text, "hello "));
+    assert(!strcmp(lines.items[1].text, "world"));
+    assert(lines.items[0].soft_wrap && lines.items[0].source_end == 6);
+    lines_free(&lines);
+
+    /* A word too long for a fresh row fills the current row and splits. */
+    conversation_wrap(&lines, CONVERSATION_ASSISTANT, 0, "a bbbbbbbb", 4);
+    assert(lines.count == 3);
+    assert(!strcmp(lines.items[0].text, "a bb"));
+    assert(!strcmp(lines.items[1].text, "bbbb"));
+    assert(!strcmp(lines.items[2].text, "bb"));
+    lines_free(&lines);
+
+    /* Styles spanning the break reopen on the next row; rows rejoin exactly. */
+    conversation_wrap(&lines, CONVERSATION_ASSISTANT, 0,
+                      "one \x1b[0;1mtwo three\x1b[0m four", 10);
+    assert(lines.count == 2);
+    assert(!strcmp(lines.items[0].text, "one \x1b[0;1mtwo "));
+    assert(lines.items[0].source_end == strlen("one \x1b[0;1mtwo "));
+    assert(!strcmp(lines.items[1].text, "\x1b[0;1mthree\x1b[0m four"));
+    lines_free(&lines);
+
     conversation_wrap(&lines, CONVERSATION_USER, 0, "👩‍💻éB", 5);
     assert(lines.count == 2);
     assert(!strcmp(lines.items[0].text, STYLE_USER "›" STYLE_RESET " 👩‍💻é"));
