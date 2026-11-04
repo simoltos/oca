@@ -2730,6 +2730,8 @@ static int openai_chunk(openai_run *run, const char *data, size_t length) {
                              reasoning ? "reasoning" : "message", cJSON_GetObjectItemCaseSensitive(item->value, "type"), 1);
                 if (openai_text(run, item, delta, reasoning)) ok = 0;
             }
+        } else if (!strcmp(type, "response.metadata")) {
+            /* Advisory backend metadata does not supply output or completion. */
         } else if (strcmp(type, "response.output_text.done") && strcmp(type, "response.content_part.added") &&
                    strcmp(type, "response.content_part.done") && strcmp(type, "response.reasoning_summary_part.added") &&
                    strcmp(type, "response.reasoning_summary_part.done") && strcmp(type, "response.reasoning_summary_text.done") &&

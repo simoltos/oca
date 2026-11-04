@@ -481,6 +481,60 @@ static void test_empty_completion(oca_llm *llm) {
     }
 }
 
+static void test_openai_metadata(oca_llm *llm) {
+    const char metadata[] = "data: {\"type\":\"response.metadata\",\"metadata\":{\"fixture\":true},"
+        "\"delta\":\"ignored\",\"usage\":{\"input_tokens\":999},"
+        "\"item\":{\"type\":\"function_call\",\"name\":\"unrequested\"}}\n\n";
+    const char *fixtures[] = {OPENAI_TEXT, OPENAI_TOOLS};
+    const char *markers[] = {"data: {\"type\":\"response.output_item.added\"",
+                             "data: {\"type\":\"response.completed\""};
+    oca_request *request = request_for("gpt-6-astra");
+    char err[256];
+    for (size_t i = 0; i < 2; i++) {
+        byte_buffer body = {0};
+        const char *start = fixtures[i];
+        for (size_t k = 0; k < 2; k++) {
+            const char *at = strstr(start, markers[k]);
+            assert(at && !buffer_append(&body, start, (size_t)(at - start), OPENAI_FRAME_MAX));
+            assert(!buffer_append(&body, metadata, strlen(metadata), OPENAI_FRAME_MAX));
+            start = at;
+        }
+        assert(!buffer_append(&body, start, strlen(start), OPENAI_FRAME_MAX));
+        server service = serve(200, body.data);
+        event_log log = {0};
+        assert(!openai_generate(llm, request, collect, &log, service.url,
+                               "http://127.0.0.1:1/unused", err, sizeof(err)));
+        free(capture_request(&service));
+        assert(log.starts == 1 && log.done == 1 && !log.errors);
+        if (!i) {
+            assert(!strcmp(log.text, "OK") && !log.calls && !log.ends);
+            assert(log.reasoning == 1 && log.states == 1 && log.usage == 1);
+            assert(log.counters.input_tokens == 100 && log.counters.cache_hit_tokens == 60);
+            assert(log.state && strstr(log.state, "fixture-ciphertext"));
+        } else {
+            assert(!*log.text && log.calls == 1 && log.ends == 1 && !log.usage && !log.states);
+            assert(!strcmp(log.call_name, "read") && !strcmp(log.call_id, "call-1"));
+            assert(!strcmp(log.arguments, "{\"path\":\"fixture\"}"));
+        }
+        free(log.state);
+        const char *completion = strstr(body.data, markers[1]);
+        assert(completion);
+        body.data[completion - body.data] = 0;
+        log = diagnostic_exchange(llm, request, body.data, "stream_end", "response.completed");
+        assert(!log.calls && !log.ends);
+        buffer_free(&body);
+    }
+    diagnostic_exchange(llm, request, metadata, "event_order", "type");
+    byte_buffer after = {0};
+    assert(!buffer_append(&after, OPENAI_TEXT, strlen(OPENAI_TEXT), OPENAI_FRAME_MAX));
+    assert(!buffer_append(&after, metadata, strlen(metadata), OPENAI_FRAME_MAX));
+    diagnostic_exchange(llm, request, after.data, "event_order", "type");
+    buffer_free(&after);
+    diagnostic_exchange(llm, request, "data: {\"type\":\"response.metadata\",broken}\n\n",
+                        "frame_json", "frame");
+    oca_request_destroy(request);
+}
+
 static void test_stream_diagnostics(oca_llm *llm) {
     oca_request *request = request_for("gpt-6-astra");
     event_log log = diagnostic_exchange(llm, request, "data: {broken}\n\n", "frame_json", "frame");
@@ -1020,6 +1074,7 @@ int main(void) {
     test_compaction_settings();
     test_openai(llm);
     test_empty_completion(llm);
+    test_openai_metadata(llm);
     test_stream_diagnostics(llm);
     test_chat_rejection_details();
     test_deepseek(llm);
