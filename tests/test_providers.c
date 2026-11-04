@@ -756,8 +756,8 @@ static void test_openai(oca_llm *llm) {
     oca_request_destroy(request);
 }
 
-/* Exercise the production catalog through OAuth transport, not fixture-only IDs. */
-static void test_builtin_openai(const char *auth) {
+/* Exercise production model selection and wire requests, not fixture-only IDs. */
+static void test_builtin_requests(const char *auth) {
     char err[256];
     size_t count;
     const oca_model_definition *models = oca_llm_builtin_models(&count);
@@ -796,6 +796,25 @@ static void test_builtin_openai(const char *auth) {
         }
         oca_request_destroy(request);
     }
+    const oca_model *kimi = oca_llm_model_resolve(llm, "k3.1-pro");
+    assert(kimi && kimi->reasoning_count == 3);
+    const char *levels[] = {"low", "high", "max"};
+    oca_request *request = oca_request_create(OCA_PURPOSE_TURN, 20);
+    assert(request);
+    oca_request_push_msg(request, OCA_MSG_USER, "Reply OK.", NULL, NULL);
+    for (size_t i = 0; i < 3; i++) {
+        oca_request_set_route(request, kimi, oca_model_reasoning_index(kimi, levels[i]));
+        char *wire = chat_serialize(request);
+        assert(wire);
+        cJSON *body = json_parse(wire, strlen(wire));
+        assert(body && !strcmp(json_text(body, "model"), "k3.1-pro"));
+        assert(!strcmp(json_text(body, "reasoning_effort"), levels[i]));
+        const char *thinking = json_text(cJSON_GetObjectItemCaseSensitive(body, "thinking"), "type");
+        assert(!thinking || strcmp(thinking, "disabled"));
+        cJSON_Delete(body);
+        cJSON_free(wire);
+    }
+    oca_request_destroy(request);
     oca_llm_destroy(llm);
 }
 
@@ -1070,7 +1089,7 @@ int main(void) {
     }
     assert(oca_llm_auth_set_api_key(llm, "openai", "fixture-key", err, sizeof(err)) < 0);
     test_oauth(llm, directory);
-    test_builtin_openai(auth);
+    test_builtin_requests(auth);
     test_compaction_settings();
     test_openai(llm);
     test_empty_completion(llm);

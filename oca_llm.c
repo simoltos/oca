@@ -350,9 +350,10 @@ static const char *const KIMI_LEVELS[] = {"low", "high", "max"};
 
 static const oca_model_definition BUILTIN_MODELS[] = {
     /* Codex OAuth profile: 872000 context, 95% usable input. Ordinary efforts
-     * exclude Codex's multi-agent ultra mode. Audited 2026-10-01. */
+     * exclude Codex's multi-agent ultra mode. Audited 2026-11-04. */
     {"gpt-6-astra", "gpt-6-astra", "openai", 872000, GPT_LEVELS, 5, 828400},
     {"gpt-6.1-sol", "gpt-6.1-sol", "openai", 872000, GPT_LEVELS, 5, 828400},
+    {"gpt-6.1-terra", "gpt-6.1-terra", "openai", 872000, GPT_LEVELS, 5, 828400},
     {"gpt-6-sol", "gpt-6-sol", "openai", 872000, GPT_LEVELS, 5, 828400},
     {"gpt-6-luna", "gpt-6-luna", "openai", 872000, GPT_LEVELS, 5, 828400},
     {"gpt-5.6-sol", "gpt-5.6-sol", "openai", 872000, GPT_LEVELS, 5, 828400},
@@ -360,9 +361,10 @@ static const oca_model_definition BUILTIN_MODELS[] = {
     {"gpt-5.6-luna", "gpt-5.6-luna", "openai", 872000, GPT_LEVELS, 5, 828400},
     /* Reserve the largest default output (131072), not the API maximum. */
     {"deepseek-flash", "deepseek-flash", "deepseek", 1048576, DEEPSEEK_LEVELS, 4, 917504},
-    /* Kimi keeps OCA's local 16384 reserve; k3 uses the Plus/Moderato cap. */
+    /* Kimi keeps OCA's local 16384 reserve; K3/K3.1 use the Plus/Moderato cap. */
     {"k3", "k3", "kimi", 262144, KIMI_LEVELS, 3, 245760},
     {"k3-256k", "k3-256k", "kimi", 262144, KIMI_LEVELS, 3, 245760},
+    {"k3.1-pro", "k3.1-pro", "kimi", 262144, KIMI_LEVELS, 3, 245760},
     {"kimi-for-coding", "kimi-for-coding", "kimi", 1048576, KIMI_LEVELS, 3, 1032192},
 };
 

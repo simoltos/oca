@@ -411,8 +411,10 @@ int main(int argc, char **argv) {
     }
     size_t rows = 0;
     for (const char *at = value.out; *at; at++) if (*at == '\n') rows++;
-    assert(rows == 12 && strstr(value.out, "signed out"));
+    assert(rows == 14 && strstr(value.out, "signed out"));
     assert(has_model_auth(value.out, "gpt-6.1-sol", "openai", "signed out"));
+    assert(has_model_auth(value.out, "gpt-6.1-terra", "openai", "signed out"));
+    assert(has_model_auth(value.out, "k3.1-pro", "kimi", "api-key"));
     assert(!strstr(value.out, "context=") && !strstr(value.out, "reasoning:") && !strstr(value.out, "capabilities:"));
     assert(strstr(value.out, "deepseek-flash"));
     assert(!strstr(value.out, "ds4") && !strstr(value.out, "deepseek-v4-pro"));

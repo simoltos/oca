@@ -143,6 +143,7 @@ The compiled catalog includes these models:
 | --- | --- | ---: | ---: | --- |
 | `gpt-6-astra` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
 | `gpt-6.1-sol` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
+| `gpt-6.1-terra` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
 | `gpt-6-sol` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
 | `gpt-6-luna` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
 | `gpt-5.6-sol` | OpenAI | 872000 | 828400 | `low`, `medium`, `high`, `xhigh`, `max` |
@@ -151,7 +152,10 @@ The compiled catalog includes these models:
 | `deepseek-flash` | DeepSeek | 1048576 | 917504 | `off`, `low`, `high`, `max` |
 | `k3` | Kimi | 262144 | 245760 | `low`, `high`, `max` |
 | `k3-256k` | Kimi | 262144 | 245760 | `low`, `high`, `max` |
+| `k3.1-pro` | Kimi | 262144 | 245760 | `low`, `high`, `max` |
 | `kimi-for-coding` | Kimi | 1048576 | 1032192 | `low`, `high`, `max` |
+
+K3.1 Pro requires thinking and uses the Plus/Moderato context cap.
 
 For DeepSeek, `off` disables thinking. OpenAI uses browser OAuth; Kimi and
 DeepSeek request API keys when needed. Access depends on your provider account.

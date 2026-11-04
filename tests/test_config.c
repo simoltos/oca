@@ -161,13 +161,13 @@ static void check_aliases(const char *config, const char *models) {
     char err[256];
     config_store cfg;
     write_text(config, "{\"model_aliases\":{\"gpt-6-astra\":\"astra\","
-                       "\"gpt-6.1-sol\":\"sol61\",\"k3\":\"mykimi\"},"
+                       "\"gpt-6.1-sol\":\"sol61\",\"gpt-6.1-terra\":\"terra61\",\"k3.1-pro\":\"kimi31\",\"k3\":\"mykimi\"},"
                        "\"show\":{\"reasoning\":true}}");
     assert(!load_config(&cfg, err, sizeof(err)));
     assert(cfg.model_aliases && cfg.display.show_reasoning);
     size_t count = 0;
     const oca_model_definition *builtins = oca_llm_builtin_models(&count);
-    assert(count == 11);
+    assert(count == 13);
     oca_model_definition *definitions = calloc(count, sizeof(*definitions));
     assert(definitions);
     for (size_t i = 0; i < count; i++) {
@@ -189,6 +189,15 @@ static void check_aliases(const char *config, const char *models) {
     assert(sol->context_limit == 872000 && sol->input_limit == 828400);
     assert(oca_llm_model_resolve(llm, "gpt-6-astra") &&
            !strcmp(oca_llm_model_resolve(llm, "mykimi")->id, "k3"));
+    const oca_model *terra = oca_llm_model_resolve(llm, "terra61");
+    const oca_model *kimi = oca_llm_model_resolve(llm, "kimi31");
+    assert(terra && terra == oca_llm_model_resolve(llm, "gpt-6.1-terra"));
+    assert(!strcmp(terra->provider, "openai") && terra->credential_kind == OCA_CREDENTIAL_OAUTH);
+    assert(terra->context_limit == 872000 && terra->input_limit == 828400);
+    assert(kimi && kimi == oca_llm_model_resolve(llm, "k3.1-pro"));
+    assert(!strcmp(kimi->provider, "kimi") && kimi->credential_kind == OCA_CREDENTIAL_API_KEY);
+    assert(kimi->context_limit == 262144 && kimi->input_limit == 245760);
+    assert(oca_model_reasoning_index(kimi, "off") == OCA_REASONING_NONE);
     assert(oca_llm_model_resolve(llm, "deepseek-flash")->context_limit == 1048576);
     oca_llm_destroy(llm);
     free(definitions);
