@@ -544,7 +544,7 @@ static void test_history_paging_after_resize(void) {
     }
     assert(seen == (1u << 20) - 1);
     overlay_history(&app, &lines, 4);
-    assert(lines.count == 1 && !strcmp(lines.items[0].text, "A000"));
+    assert(lines.count == 4 && !strcmp(lines.items[0].text, "A000"));
     lines_free(&lines);
     size_t end = app.view_end, skip = app.view_skip;
     display_line newest = {.text = "new", .style = STYLE_RESET};
@@ -558,8 +558,10 @@ static void test_history_paging_after_resize(void) {
     history_scroll(&app, -1, 10);
     assert(app.view_skip);
     app.cols = 80;
+    history_scroll(&app, -1, 0);
     overlay_history(&app, &lines, 4);
-    assert(!app.view_skip && lines.count && !strcmp(lines.items[lines.count - 1].text, text));
+    assert(!app.view_skip && lines.count == 2 && !strcmp(lines.items[0].text, text));
+    assert(!strcmp(lines.items[1].text, "new"));
     lines_free(&lines);
     app.cols = 4;
     history_scroll(&app, -1, 10);
@@ -589,6 +591,127 @@ static void test_history_paging_after_resize(void) {
         lines_free(&lines);
         app_free(&app);
     }
+}
+
+static void test_history_upper_bound(void) {
+    const int heights[] = {1, 2, 4, 12};
+    for (size_t h = 0; h < sizeof(heights) / sizeof(heights[0]); h++) {
+        tui_app app = {.cols = 80, .rows = 24, .history_rows = heights[h]};
+        display_lines lines = {0}, top = {0};
+        for (int i = 0; i < 40; i++) {
+            char text[32];
+            snprintf(text, sizeof(text), "row-%02d", i);
+            lines_add(&lines, STYLE_RESET, text, strlen(text));
+        }
+        history_emit(&app, &lines, lines.count, 2);
+        lines_free(&lines);
+        history_scroll(&app, -1, 1000);
+        overlay_history(&app, &top, (size_t)app.history_rows);
+        assert(top.count == (size_t)app.history_rows && !strcmp(top.items[0].text, "row-00"));
+        for (int i = 0; i < 20; i++) {
+            history_scroll(&app, -1, 3);
+            overlay_history(&app, &lines, (size_t)app.history_rows);
+            assert(lines.count == top.count);
+            for (size_t j = 0; j < top.count; j++) assert(!strcmp(lines.items[j].text, top.items[j].text));
+            lines_free(&lines);
+        }
+        lines_free(&top);
+        /* A taller viewport at the upper bound fills from the start too. */
+        app.history_rows = 20;
+        history_scroll(&app, -1, 0);
+        overlay_history(&app, &lines, 20);
+        assert(lines.count == 20 && !strcmp(lines.items[0].text, "row-00"));
+        lines_free(&lines);
+        history_scroll(&app, 1, 1000);
+        assert(app.view_end == app.retained.count && !app.view_skip && !app.scroll_frozen);
+        app_free(&app);
+    }
+    tui_app app = {.cols = 80, .rows = 24, .history_rows = 20, .show_brand = 1};
+    display_lines lines = {0};
+    lines_add(&lines, STYLE_RESET, "short response", strlen("short response"));
+    history_emit(&app, &lines, lines.count, 2);
+    lines_free(&lines);
+    for (int i = 0; i < 20; i++) history_scroll(&app, -1, 3);
+    assert(app.view_end == app.retained.count && !app.view_skip && !app.scroll_frozen);
+    overlay_history(&app, &lines, 20);
+    assert(lines.count == 8 && strstr(lines.items[1].text, "OCA"));
+    lines_free(&lines);
+    app_free(&app);
+}
+
+static void test_live_preview_scroll(void) {
+    const char text[] = "A000B001C002D003E004F005G006H007I008J009"
+                        "K010L011M012N013O014P015Q016R017S018T019";
+    tui_app app = {.cols = 4, .rows = 8, .preview_rows = 4};
+    display_lines live = {0}, page = {0}, saved = {0};
+    conversation_wrap(&live, CONVERSATION_ASSISTANT, 0, text, app.cols);
+    preview_update(&app, &live);
+    lines_free(&live);
+    history_scroll(&app, -1, 3);
+    assert(app.scroll_frozen);
+    overlay_history(&app, &page, 4);
+    assert(page.count >= 4);
+    lines_copy_range(&saved, &page, page.count - 4, 4);
+    lines_free(&page);
+    /* The unfinished paragraph subsequently commits, followed by more output. */
+    conversation_wrap(&live, CONVERSATION_ASSISTANT, 0, text, app.cols);
+    history_emit(&app, &live, live.count, 2);
+    lines_free(&live);
+    for (int i = 0; i < 90; i++) {
+        display_line row = {.text = "new", .style = STYLE_RESET};
+        history_retain(&app, &row);
+    }
+    assert(app.scroll_frozen && !app.preview_base && app.history_omitted);
+    overlay_history(&app, &page, 4);
+    assert(page.count >= 4);
+    for (size_t i = 0; i < 4; i++)
+        assert(!strcmp(page.items[page.count - 4 + i].text, saved.items[i].text));
+    lines_free(&page);
+    app.cols = 8;
+    overlay_history(&app, &page, 4);
+    lines_free(&page);
+    app.cols = 4;
+    overlay_history(&app, &page, 4);
+    assert(page.count >= 4);
+    lines_free(&page);
+    history_scroll(&app, 1, 1000);
+    assert(!app.scroll_frozen && app.preview.count && app.view_end == app.retained.count);
+    lines_free(&saved);
+    app_free(&app);
+
+    app = (tui_app){.cols = 80, .rows = 24, .history_rows = 15, .preview_rows = 1};
+    conversation_wrap(&live, CONVERSATION_ASSISTANT, 0, "short preview 界é", 1);
+    preview_update(&app, &live);
+    lines_free(&live);
+    /* Source survives a narrow preview; a short response needs no scrolling. */
+    for (int i = 0; i < 8; i++) {
+        history_scroll(&app, -1, 3);
+        assert(!app.scroll_frozen && !app.view_skip && app.preview.count);
+        assert(app.view_end == app.retained.count);
+    }
+    app_free(&app);
+
+    /* Multiple wheel events can be decoded before another frame is drawn. */
+    app = (tui_app){.cols = 4, .rows = 24, .history_rows = 11, .preview_rows = 8};
+    for (int i = 0; i < 30; i++) {
+        display_line row = {.text = "old", .style = STYLE_RESET};
+        history_retain(&app, &row);
+    }
+    conversation_wrap(&live, CONVERSATION_ASSISTANT, 0, "A000B001C002D003E004F005G006H007", 4);
+    preview_update(&app, &live);
+    history_scroll(&app, -1, 3);
+    history_scroll(&app, 1, 3);
+    history_scroll(&app, -1, 3);
+    overlay_history(&app, &page, 19);
+    int found = 0;
+    for (size_t i = 0; i < page.count; i++) found |= !strcmp(page.items[i].text, "E004");
+    assert(found);
+    lines_free(&page);
+    history_scroll(&app, 1, 1000);
+    assert(!app.scroll_frozen);
+    preview_update(&app, &live); /* The next following frame has no live output. */
+    assert(!app.preview.count);
+    app_free(&app);
 }
 
 static void test_mouse_scroll(void) {
@@ -1264,6 +1387,8 @@ int main(void) {
     test_tables();
     test_retained_reflow();
     test_history_paging_after_resize();
+    test_history_upper_bound();
+    test_live_preview_scroll();
     test_mouse_scroll();
     test_question_replay();
     test_inline_question();

@@ -177,6 +177,10 @@ The transcript separates messages with two blank lines.
 OCA uses the terminal's alternate screen throughout the interactive session.
 Resizing reflows retained conversation output and updates the editor, menus,
 and status bar. PageUp/PageDown browse retained output in both the main and
-temporary chats. Exiting restores the terminal's previous screen and scrollback.
+temporary chats. Scrolling up stops at the first page; further wheel or PageUp
+input keeps that page visible. Scrolling during a response includes its visible
+unfinished text and holds the viewed output while generation continues. Returning to the
+bottom resumes the current output. Exiting restores the terminal's previous
+screen and scrollback.
 Save the conversation to reopen it later; chat output does not enter the shell's
 scrollback.

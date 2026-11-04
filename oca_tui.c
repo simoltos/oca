@@ -176,6 +176,10 @@ struct tui_app {
     size_t view_end;
     size_t view_skip;           /* Wrapped rows below the viewed end of its last group. */
     int history_rows;           /* Available conversation rows in the last frame. */
+    display_lines preview;     /* Owned source rows for the last visible live output. */
+    size_t preview_base;        /* Retained prefix belonging to that preview. */
+    int preview_rows;
+    int scroll_frozen;          /* Read a snapshot until scrolling back to its tail. */
     const char *workspace;
     char *owned_workspace;
     char *tool_id;
@@ -1894,7 +1898,10 @@ static void history_trim(tui_app *app, size_t bytes, size_t rows) {
         memmove(app->retained.items + first, app->retained.items + end,
                 (app->retained.count - end) * sizeof(*app->retained.items));
         app->retained.count -= drop;
-        if (app->view_end > first) app->view_end = app->view_end >= end ? app->view_end - drop : first;
+        size_t view_drop = app->scroll_frozen && drop > app->preview_base ? app->preview_base : drop;
+        app->preview_base = app->preview_base > drop ? app->preview_base - drop : 0;
+        if (app->view_end > first)
+            app->view_end = app->view_end >= view_drop ? app->view_end - view_drop : 0;
         if (!app->view_end) app->view_skip = 0;
     }
 }
@@ -1914,7 +1921,7 @@ static void history_retain(tui_app *app, const display_line *row) {
         buffer_free(&original);
         return;
     }
-    int following = app->view_end == app->retained.count && !app->view_skip;
+    int following = !app->scroll_frozen && app->view_end == app->retained.count && !app->view_skip;
     history_trim(app, bytes, 1);
     lines_add(&app->retained, row->style, text, text_bytes - 1);
     display_line *copy = &app->retained.items[app->retained.count - 1];
@@ -2082,6 +2089,29 @@ static void frame_border(display_lines *lines, const char *left, const char *rig
     buffer_free(&row);
 }
 
+/* Move the rendered rows into the last-frame cache without duplicating them. */
+static void preview_update(tui_app *app, display_lines *stream) {
+    lines_free(&app->preview);
+    app->preview = *stream;
+    memset(stream, 0, sizeof(*stream));
+    app->preview_base = app->retained.count;
+}
+
+/* The temporary vector borrows row contents for this call. New output can
+ * append to retained history without changing the frozen prefix or preview. */
+static const display_lines *history_view(tui_app *app, display_lines *scratch) {
+    if (!app->scroll_frozen) return &app->retained;
+    size_t base = app->preview_base < app->retained.count ? app->preview_base : app->retained.count;
+    scratch->count = base + app->preview.count;
+    scratch->items = checked_realloc(NULL, scratch->count * sizeof(*scratch->items));
+    if (base) memcpy(scratch->items, app->retained.items, base * sizeof(*scratch->items));
+    if (app->preview.count)
+        memcpy(scratch->items + base, app->preview.items, app->preview.count * sizeof(*scratch->items));
+    return scratch;
+}
+
+static int overlay_history(tui_app *app, display_lines *page, size_t rows);
+
 static size_t history_group_first(const display_lines *history, size_t end) {
     size_t first = end - 1;
     while (first && history->items[first].card_role && !history->items[first].card_first) first--;
@@ -2100,38 +2130,69 @@ static size_t history_group_end(const display_lines *history, size_t first) {
     return end;
 }
 
-static size_t history_group_rows(tui_app *app, size_t first, size_t end) {
+static size_t history_group_rows(const display_lines *history, int cols, size_t first, size_t end) {
     display_lines wrapped = {0};
-    retained_group(&wrapped, &app->retained, first, end, app->cols);
+    retained_group(&wrapped, history, first, end, cols);
     size_t count = wrapped.count;
     lines_free(&wrapped);
     return count;
 }
 
 /* Message separators must not conceal the last output in a tiny viewport. */
-static size_t history_tail_end(const tui_app *app, size_t rows) {
-    size_t end = app->retained.count;
+static size_t history_tail_end(const display_lines *history, size_t rows) {
+    size_t end = history->count;
     if (rows > 0 && rows < 3) {
         size_t text_end = end;
-        while (text_end && !app->retained.items[text_end - 1].text[0] &&
-               !app->retained.items[text_end - 1].card_role) text_end--;
+        while (text_end && !history->items[text_end - 1].text[0] &&
+               !history->items[text_end - 1].card_role) text_end--;
         if (text_end && end - text_end >= rows) end = text_end + rows - 1;
     }
     return end;
 }
 
 static void history_scroll(tui_app *app, int direction, size_t step) {
-    size_t end = app->view_end < app->retained.count ? app->view_end : app->retained.count;
+    int newly_frozen = 0, resume_at_tail = direction > 0;
+    if (direction < 0 && !app->scroll_frozen &&
+        app->view_end == app->retained.count && !app->view_skip) {
+        /* Capture bounded source rows once, when the user starts scrolling. */
+        if (!app->preview.count) app->preview_base = app->retained.count;
+        tui_app snapshot = {0};
+        for (size_t i = 0; i < app->preview.count; i++)
+            history_retain(&snapshot, &app->preview.items[i]);
+        lines_free(&app->preview);
+        app->preview = snapshot.retained;
+        app->scroll_frozen = newly_frozen = 1;
+        app->view_end = app->preview_base + app->preview.count;
+    }
+    size_t viewport = (size_t)(app->history_rows + app->preview_rows);
+    display_lines scratch = {0};
+    const display_lines *history = history_view(app, &scratch);
+    size_t end = app->view_end < history->count ? app->view_end : history->count;
     size_t skip = app->view_skip;
-    size_t tail = history_tail_end(app, (size_t)app->history_rows);
-    if (direction < 0 && !skip && end == app->retained.count) end = tail;
+    size_t tail = history_tail_end(history, viewport);
+    if (direction < 0 && !skip && end == history->count) end = tail;
     if (end && skip) {
-        size_t count = history_group_rows(app, history_group_first(&app->retained, end), end);
+        size_t count = history_group_rows(history, app->cols, history_group_first(history, end), end);
         if (skip >= count) skip = count ? count - 1 : 0;
     }
+    if (direction < 0) {
+        /* Measure from the actual endpoint, including tiny-view separator
+         * clipping. Never move above a full first page of visible output. */
+        tui_app view = *app;
+        view.view_end = end;
+        view.view_skip = skip;
+        display_lines page = {0};
+        overlay_history(&view, &page, viewport + step);
+        if (page.count < viewport) {
+            /* Growing the viewport can put an old position above its limit. */
+            direction = 1;
+            step = viewport - page.count;
+        } else if (step > page.count - viewport) step = page.count - viewport;
+        lines_free(&page);
+    }
     while (step && direction < 0 && end) {
-        size_t first = history_group_first(&app->retained, end);
-        size_t count = history_group_rows(app, first, end);
+        size_t first = history_group_first(history, end);
+        size_t count = history_group_rows(history, app->cols, first, end);
         size_t visible = count - skip;
         if (step < visible) { skip += step; break; }
         if (!first) { skip = count ? count - 1 : 0; break; }
@@ -2144,34 +2205,43 @@ static void history_scroll(tui_app *app, int direction, size_t step) {
             size_t move = step < skip ? step : skip;
             skip -= move;
             step -= move;
-        } else if (end < app->retained.count) {
-            size_t next = history_group_end(&app->retained, end);
-            size_t count = history_group_rows(app, end, next);
+        } else if (end < history->count) {
+            size_t next = history_group_end(history, end);
+            size_t count = history_group_rows(history, app->cols, end, next);
             end = next;
             if (step < count) { skip = count - step; break; }
             step -= count;
         } else break;
     }
-    if (direction > 0 && !skip && end >= tail) end = app->retained.count;
+    if (resume_at_tail && !skip && end >= tail) end = history->count;
+    if (app->scroll_frozen && !skip && end >= tail && (resume_at_tail || newly_frozen)) {
+        app->scroll_frozen = 0;
+        end = app->retained.count;
+        /* Keep the displayed preview until the next render replaces it:
+         * another wheel event can arrive in this same input batch. */
+    }
+    free(scratch.items);
     app->view_end = end;
     app->view_skip = skip;
 }
 
 static int overlay_history(tui_app *app, display_lines *page, size_t rows) {
-    size_t end = app->view_end < app->retained.count ? app->view_end : app->retained.count;
+    display_lines scratch = {0};
+    const display_lines *history = history_view(app, &scratch);
+    size_t end = app->view_end < history->count ? app->view_end : history->count;
     size_t skip = app->view_skip;
     if (end && skip) {
-        size_t count = history_group_rows(app, history_group_first(&app->retained, end), end);
+        size_t count = history_group_rows(history, app->cols, history_group_first(history, end), end);
         if (skip >= count) skip = count ? count - 1 : 0;
     } else skip = 0;
     app->view_skip = skip;
-    if (!skip && end == app->retained.count) end = history_tail_end(app, rows);
+    if (!skip && end == history->count) end = history_tail_end(history, rows);
     size_t first = end, height = 0;
     while (first && height < rows + skip) {
         display_lines wrapped = {0};
         size_t last = first;
-        first = history_group_first(&app->retained, last);
-        retained_group(&wrapped, &app->retained, first, last, app->cols);
+        first = history_group_first(history, last);
+        retained_group(&wrapped, history, first, last, app->cols);
         height += wrapped.count;
         lines_free(&wrapped);
     }
@@ -2180,13 +2250,14 @@ static int overlay_history(tui_app *app, display_lines *page, size_t rows) {
     int has_brand = page->count > before_brand;
     if (!first && app->history_omitted)
         lines_wrap(page, STYLE_MUTED, "", "...[earlier display output omitted]", app->cols, SIZE_MAX, NULL, NULL);
-    for (size_t i = first; i < end;) i = retained_group(page, &app->retained, i, end, app->cols);
+    for (size_t i = first; i < end;) i = retained_group(page, history, i, end, app->cols);
     while (skip && page->count) {
         skip--;
         display_line *row = &page->items[--page->count];
         free(row->text);
         free(row->source);
     }
+    free(scratch.items);
     return has_brand;
 }
 
@@ -2350,8 +2421,8 @@ static void render_block(tui_app *app) {
         if (stream.count) lines_add(&stream, STYLE_RESET, "", 0);
         question_lines(app, &stream, &question_cursor_row, &question_cursor_col);
     }
-    if (!question && (app->view_end < app->retained.count || app->view_skip))
-        lines_free(&stream);
+    int following = !app->scroll_frozen && app->view_end == app->retained.count && !app->view_skip;
+    if (!question && !following) lines_free(&stream);
     char *notice = shared_row(app);
     int status_rows = app->rows >= 2 ? 1 : 0;
     int notice_rows = notice && app->rows >= 3 && (!question || app->notice[0]) ? 1 : 0;
@@ -2535,6 +2606,8 @@ static void render_block(tui_app *app) {
     terminal_update_begin();
     int history_rows = app->rows - (int)lines.count;
     app->history_rows = history_rows;
+    app->preview_rows = !question && following ? (int)stream_rows : 0;
+    if (app->scroll_frozen) history_scroll(app, -1, 0);
     display_lines page = {0};
     int has_brand = overlay_history(app, &page, (size_t)history_rows);
     size_t shown = page.count < (size_t)history_rows ? page.count : (size_t)history_rows;
@@ -2565,6 +2638,7 @@ static void render_block(tui_app *app) {
     app->redraw_urgent = 0;
     app->last_render_ms = monotonic_ms();
     free(notice);
+    if (!question && following) preview_update(app, &stream);
     lines_free(&stream);
     lines_free(&control);
     lines_free(&composer);
@@ -3758,7 +3832,9 @@ static void handle_event(tui_app *app, oca_core_event *event) {
             stream_clear(app);
             side_close(app);
             lines_free(&app->retained);
-            app->retained_bytes = app->view_end = app->view_skip = 0;
+            lines_free(&app->preview);
+            app->retained_bytes = app->view_end = app->view_skip = app->preview_base = 0;
+            app->scroll_frozen = app->preview_rows = 0;
             app->history_omitted = 0;
             if (event->session_new) main_view(app)->welcome_pending = 1;
         }
@@ -4141,7 +4217,7 @@ static void mouse_report(tui_app *app) {
     if ((*at != 'M' && *at != 'm') || at[1] || !values[1] || !values[2]) return;
     unsigned button = values[0] & ~28u; /* Shift, Alt, Ctrl do not change direction. */
     if (*at == 'M' && (button == 64 || button == 65) &&
-        app->menu == MENU_NONE && app->history_rows > 0) {
+        app->menu == MENU_NONE && app->history_rows + app->preview_rows > 0) {
         history_scroll(app, button == 64 ? -1 : 1, 3);
         app->dirty = app->redraw_urgent = 1;
     }
@@ -4175,9 +4251,10 @@ static int escape_action(tui_app *app) {
     if (!strcmp(sequence, "\x1b[47;5u")) {
         view_switch(app);
     } else if (!strcmp(sequence, "\x1b[5~") || !strcmp(sequence, "\x1b[6~")) {
-        if (app->menu == MENU_NONE && app->history_rows > 0)
+        if (app->menu == MENU_NONE && app->history_rows + app->preview_rows > 0)
             history_scroll(app, !strcmp(sequence, "\x1b[5~") ? -1 : 1,
-                           app->history_rows > 1 ? (size_t)app->history_rows - 1 : 1);
+                           app->history_rows + app->preview_rows > 1 ?
+                           (size_t)(app->history_rows + app->preview_rows) - 1 : 1);
     } else if (!strcmp(sequence, "\x1b[A")) {
         if (app->menu == MENU_INTERACTION && app->interaction_details) input_vertical(app, -1);
         else if (app->menu != MENU_NONE) menu_move(app, -1);
@@ -4590,6 +4667,7 @@ static void app_free(tui_app *app) {
     interaction_free(app);
     stream_clear(app);
     lines_free(&app->retained);
+    lines_free(&app->preview);
     free(app->owned_workspace);
     free(app->tool_id);
     free(app->tool_name);

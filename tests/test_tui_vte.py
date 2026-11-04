@@ -24,6 +24,11 @@ gi.require_version("Vte", "2.91")
 from gi.repository import Gdk, GLib, Gtk, Pango, Vte  # noqa: E402
 
 
+preview_continue = threading.Event()
+preview_finish = threading.Event()
+preview_sent = threading.Event()
+
+
 class Provider(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
@@ -54,6 +59,19 @@ class Provider(BaseHTTPRequestHandler):
                 args = {"questions": [{"question": "Which color?", "options": ["red", "blue"]}]}
                 delta({"tool_calls": [{"index": 0, "id": "resize-question-1", "type": "function",
                        "function": {"name": "ask_user", "arguments": json.dumps(args)}}]}, "tool_calls")
+            elif prompt == "completed-scroll":
+                delta({"content": "".join(f"ROW-{i:03d} completed response line\n" for i in range(40))}, "stop")
+            elif prompt in ("preview-short", "preview-long"):
+                content = "EARLY_VISIBLE " + "preview words " * 12 if prompt == "preview-short" else (
+                    "BEGIN_PREVIEW " + " ".join(f"item{i:03d}" for i in range(400)) + " LIVE_TAIL")
+                delta({"content": content})
+                if not preview_continue.wait(15):
+                    raise AssertionError("preview test did not release the stream")
+                delta({"content": "\n" + "NEW_OUTPUT\n" * 10})
+                preview_sent.set()
+                if prompt == "preview-long" and not preview_finish.wait(15):
+                    raise AssertionError("preview test did not finish the stream")
+                delta({}, "stop")
             elif prompt == "resize-stream":
                 for i in range(80):
                     delta({"content": f"stream-{i:03d} Unicode 界 e\u0301\n"})
@@ -189,6 +207,41 @@ def exercise(session, max_rows, max_cols):
         session.resize(rows, cols)
         if rows >= 12:
             session.wait(lambda: "OCA" in session.rows()[1], "welcome banner at top")
+    preview_continue.clear()
+    session.send("preview-short\r")
+    session.wait(lambda: "EARLY_VISIBLE" in session.text(), "short live preview")
+    session.scroll(Gdk.ScrollDirection.UP)
+    pump(.15)
+    assert "EARLY_VISIBLE" in session.text(), "scroll must not hide a short live preview"
+    preview_continue.set()
+    session.wait(lambda: "Working" not in session.text(), "short preview completion")
+
+    preview_continue.clear()
+    preview_sent.clear()
+    session.send("preview-long\r")
+    session.wait(lambda: "LIVE_TAIL" in session.text(), "long live preview")
+    session.scroll(Gdk.ScrollDirection.UP)
+    session.wait(lambda: "LIVE_TAIL" not in session.text(), "scroll within live preview")
+    def visible_preview():
+        return tuple(line for line in session.rows() if "item" in line or "BEGIN_PREVIEW" in line)
+    frozen = visible_preview()
+    assert frozen, "live preview must remain scrollable before a newline arrives"
+    preview_continue.set()
+    session.wait(preview_sent.is_set, "continued output sent")
+    pump(.15)
+    assert visible_preview()[-len(frozen):] == frozen, "new output must preserve the viewed preview"
+    session.resize(12, 32)
+    pump(.1)
+    assert visible_preview(), "live preview must reflow after resizing"
+    session.resize(24, 80)
+    pump(.1)
+    assert visible_preview()[-len(frozen):] == frozen
+    preview_finish.set()
+    session.wait(lambda: "Working" not in session.text(), "frozen preview completion")
+    assert "NEW_OUTPUT" not in session.text(), "completion must not jump away from the viewed preview"
+    for _ in range(30):
+        session.scroll(Gdk.ScrollDirection.DOWN)
+    session.wait(lambda: "NEW_OUTPUT" in session.text(), "return to current output")
     # A tall draft fills the viewport at every grid point. The cursor remains
     # at the first logical byte, making geometry assertions independent of
     # history height and of whether the editor's remaining lines are clipped.
@@ -271,6 +324,50 @@ def exercise(session, max_rows, max_cols):
     print(f"VTE: {count} grid sizes, abrupt/rapid resizes, menus, wheel/touchpad, streaming, questions, history, temporary chat, shell restoration passed")
 
 
+def exercise_completed_scroll(session, executable, url, directory):
+    session.send("completed-scroll\r")
+    session.wait(lambda: "ROW-039" in session.text() and "Working" not in session.text(), "completed response")
+    pump(.1)
+    session.send("/quit\r")
+    session.wait(lambda: "Save current" in session.text(), "save completed session")
+    session.send("y\r")
+    session.wait(lambda: session.exited, "saved exit")
+    saved = list((directory / "home" / ".oca" / "sessions").glob("*.oca"))
+    assert len(saved) == 1
+    env = dict(os.environ, HOME=str(directory / "home"), TERM="xterm-256color", LC_ALL="C.UTF-8",
+               KIMI_API_KEY="fixture-api-key", OCA_TEST_PROVIDER_URL=url)
+    session.exited = False
+    _ok, session.pid = session.terminal.spawn_sync(
+        Vte.PtyFlags.DEFAULT, str(directory / "work"), [str(executable), "resume", saved[0].stem],
+        [key + "=" + value for key, value in env.items()], GLib.SpawnFlags.DEFAULT, None, None, None)
+    session.wait(lambda: "ROW-039" in session.text(), "resumed completed response")
+    for rows, cols in [(24, 80), (9, 28), (48, 120), (24, 80)]:
+        session.resize(rows, cols)
+        for _ in range(80):
+            session.scroll(Gdk.ScrollDirection.UP)
+        first_page = session.rows()
+        assert any("completed-scroll" in line for line in first_page[:6]), "first prompt must remain visible at top"
+        if rows >= 24:
+            assert "ROW-000" in session.text(), "first response lines must remain visible at top"
+        for _ in range(12):
+            session.scroll(Gdk.ScrollDirection.UP)
+            assert session.rows() == first_page, "scrolling above the first page must leave it intact"
+    for _ in range(40):
+        session.send("\x1b[5~")
+    pump(.1)
+    assert session.rows() == first_page, "PageUp must stop at the same upper bound"
+    session.terminal.select_all()
+    assert "ROW-000" in session.terminal.get_text_selected(Vte.Format.TEXT)
+    session.terminal.unselect_all()
+    for _ in range(30):
+        session.scroll(Gdk.ScrollDirection.DOWN)
+    session.wait(lambda: "ROW-039" in session.text(), "return to last response lines")
+    session.send("/quit\r")
+    session.wait(lambda: session.exited, "resumed session exit")
+    assert session.exit_status == 0 and session.text() == session.primary_before
+    print("VTE: resumed completed session, upper scroll bound, PageUp, resize, and return to bottom passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", nargs="?", default="tests/oca-fixture", type=Path)
@@ -282,13 +379,21 @@ def main():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="oca-vte-test-") as directory:
-            session = Session(args.executable.resolve(), f"http://127.0.0.1:{server.server_port}/", Path(directory))
-            try:
-                exercise(session, args.rows, args.cols)
-            finally:
-                session.close()
+        for scenario in ("completed", "streaming"):
+            with tempfile.TemporaryDirectory(prefix="oca-vte-test-") as directory:
+                directory = Path(directory)
+                url = f"http://127.0.0.1:{server.server_port}/"
+                session = Session(args.executable.resolve(), url, directory)
+                try:
+                    if scenario == "completed":
+                        exercise_completed_scroll(session, args.executable.resolve(), url, directory)
+                    else:
+                        exercise(session, args.rows, args.cols)
+                finally:
+                    session.close()
     finally:
+        preview_continue.set()
+        preview_finish.set()
         server.shutdown()
         server.server_close()
         thread.join()
