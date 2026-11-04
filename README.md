@@ -60,6 +60,10 @@ Each model corresponds to a provider. If its credentials aren't saved,
 OCA prompts you to authenticate with an API key or OAuth before running the
 model.
 
+The interactive interface uses the terminal's alternate screen. PageUp/PageDown
+browse conversation output. Exiting restores the previous terminal screen;
+save the conversation to reopen it later.
+
 ## Why?
 
 Almost every major vendor has its own harness and, while this seems to allow

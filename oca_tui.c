@@ -134,6 +134,7 @@ typedef struct {
     int soft_wrap;
     size_t prefix_bytes;
     int card_role;                 /* top, content, bottom of a question card */
+    int card_first, card_last;    /* Boundaries also survive borderless cards. */
 } display_line;
 
 typedef struct {
@@ -168,12 +169,13 @@ struct tui_app {
     int side_chat, hidden, closing;
     int restore_pending;
     int welcome_pending;
-    int overlay;
+    int show_brand;
     int history_omitted;
     display_lines retained;
     size_t retained_bytes;
-    size_t flushed_rows;
     size_t view_end;
+    size_t view_skip;           /* Wrapped rows below the viewed end of its last group. */
+    int history_rows;           /* Available conversation rows in the last frame. */
     const char *workspace;
     char *owned_workspace;
     char *tool_id;
@@ -218,8 +220,6 @@ struct tui_app {
     int failed;
     int rows;
     int cols;
-    int block_lines;
-    int block_cursor_row;
     char *stream_text;
     size_t stream_text_len;
     conversation_kind stream_kind;
@@ -279,6 +279,11 @@ static volatile sig_atomic_t signal_exit;
 static volatile sig_atomic_t signal_resize;
 static volatile sig_atomic_t signal_wake_write = -1;
 static terminal_state *active_terminal;
+/* Batch redraws so a resize is less likely to split cursor movement from the
+ * rows it describes. Large history writes still use bounded storage. */
+static char terminal_output[65536];
+static size_t terminal_output_length;
+static int terminal_buffering;
 
 static void command_menu(tui_app *app);
 static void menu_clear(tui_app *app);
@@ -293,7 +298,7 @@ static void tool_action_lines(tui_app *app, display_lines *lines, int state, con
 static void conversation_wrap(display_lines *lines, conversation_kind kind, int continued,
                               const char *text, int cols);
 static void input_clear(tui_app *app);
-static void overlay_leave(tui_app *main);
+static void brand_lines(tui_app *app, display_lines *lines);
 static size_t sgr_length(const char *text);
 static void interaction_restore(tui_app *app);
 static void question_lines(tui_app *app, display_lines *lines, int *cursor_row, int *cursor_col);
@@ -320,7 +325,7 @@ static int command_accepts_arguments(const command_info *command) {
  * Terminal and text helpers
  * ========================================================================== */
 
-static void write_all(const char *data, size_t len) {
+static void terminal_write(const char *data, size_t len) {
     while (len) {
         ssize_t n = write(STDOUT_FILENO, data, len);
         if (n < 0) {
@@ -342,6 +347,27 @@ static void write_all(const char *data, size_t len) {
     }
 }
 
+static void terminal_flush(void) {
+    terminal_write(terminal_output, terminal_output_length);
+    terminal_output_length = 0;
+}
+
+static void write_all(const char *data, size_t len) {
+    if (!terminal_buffering) {
+        terminal_write(data, len);
+        return;
+    }
+    while (len) {
+        size_t room = sizeof(terminal_output) - terminal_output_length;
+        size_t count = len < room ? len : room;
+        memcpy(terminal_output + terminal_output_length, data, count);
+        terminal_output_length += count;
+        data += count;
+        len -= count;
+        if (terminal_output_length == sizeof(terminal_output)) terminal_flush();
+    }
+}
+
 static void write_text(const char *text) {
     write_all(text, strlen(text));
 }
@@ -353,14 +379,16 @@ static long long monotonic_ms(void) {
 }
 
 static void terminal_restore(void) {
+    terminal_buffering = 0;
+    terminal_output_length = 0;
     terminal_state *term = active_terminal;
     if (!term || !term->active) return;
     if (term->alternate_screen) {
-        write_text("\x1b[?1049l");
+        write_text("\x1b[?1000l\x1b[?1006l\x1b[?1049l");
         term->alternate_screen = 0;
     }
     if (term->title_saved) write_text("\x1b[23;2t");
-    write_text(STYLE_RESET "\x1b[?7h\x1b[?2004l\x1b[?25h\r\n");
+    write_text(STYLE_RESET "\x1b[?7h\x1b[?2004l\x1b[?25h");
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->saved);
     fcntl(STDIN_FILENO, F_SETFL, term->saved_flags);
     term->active = 0;
@@ -437,7 +465,8 @@ static int terminal_enter(terminal_state *term) {
     term->active = 1;
     active_terminal = term;
     atexit(terminal_restore);
-    write_text(STYLE_RESET "\x1b[?7h\x1b[?2004h\x1b[?25h");
+    term->alternate_screen = 1;
+    write_text("\x1b[?1049h\x1b[H\x1b[2J" STYLE_RESET "\x1b[?7h\x1b[?2004h\x1b[?1006h\x1b[?1000h\x1b[?25h");
     return 0;
 }
 
@@ -876,44 +905,16 @@ static int text_columns(const char *text) {
     return columns;
 }
 
-static void refresh_geometry(tui_app *app) {
-    terminal_size(app);
-    if (app->block_lines > app->rows) app->block_lines = app->rows;
-    /* A shorter viewport clips rows below the cursor first. It does not
-     * necessarily remove rows above it within the live block. */
-    if (app->block_cursor_row >= app->block_lines && app->block_lines > 0)
-        app->block_cursor_row = app->block_lines - 1;
-}
-
 static void terminal_update_begin(void) {
+    terminal_buffering = 1;
     write_text("\x1b[?25l\x1b[?7l");
 }
 
-static void terminal_update_end(void) {
-    write_text(STYLE_RESET "\x1b[?7h\x1b[?25h");
-}
-
-/* Clears the known live rows and leaves the cursor at their first row. */
-static void clear_block(tui_app *app) {
-    if (!app->block_lines) return;
-    char move[32];
-    write_text("\r");
-    if (app->block_cursor_row > 0) {
-        snprintf(move, sizeof(move), "\x1b[%dA", app->block_cursor_row);
-        write_text(move);
-    }
-    /* Erasing must not scroll after the terminal clips the old block. */
-    write_text("\x1b[J");
-    app->block_lines = 0;
-    app->block_cursor_row = 0;
-}
-
-static void erase_block(tui_app *app) {
-    if (!app->block_lines) return;
-    refresh_geometry(app);
-    terminal_update_begin();
-    clear_block(app);
-    terminal_update_end();
+static void terminal_update_end(int cursor_visible) {
+    write_text(STYLE_RESET "\x1b[?7h");
+    write_text(cursor_visible ? "\x1b[?25h" : "\x1b[?25l");
+    terminal_buffering = 0;
+    terminal_flush();
 }
 
 static const char *goal_name(oca_goal_state goal) {
@@ -1698,7 +1699,7 @@ static void conversation_wrap(display_lines *lines, conversation_kind kind, int 
                  * the source, so physical rows still rejoin exactly. A word
                  * too long for a fresh row would split anyway: keep filling
                  * this row instead of leaving a gap. */
-                if (break_at) {
+                if (break_at && kind != CONVERSATION_ANSWER) {
                     int word_width = 0;
                     for (size_t scan = break_at; scan < length &&
                          text[scan] != '\n' && text[scan] != ' ';) {
@@ -1785,35 +1786,41 @@ static void retained_wrap(display_lines *target, const display_line *row, int co
     }
 }
 
+static void retained_question_line(display_lines *body, conversation_kind kind,
+                                    const char *style, const char *text, int cols) {
+    size_t first = body->count;
+    if (kind) conversation_wrap(body, kind, 0, text, cols);
+    else question_wrap(body, style, text, cols);
+    if (!strcmp(style, STYLE_RESET STYLE_BOLD)) style = STYLE_BOLD;
+    for (size_t i = first; i < body->count; i++) body->items[i].style = style;
+}
+
 static size_t retained_card(display_lines *target, const display_lines *history,
                             size_t first, size_t limit, int cols) {
-    size_t end = first + 1;
-    while (end < limit && history->items[end].card_role != 3) end++;
+    size_t end = first;
+    while (end < limit && !history->items[end].card_last) end++;
     if (end == limit) return first;
     display_lines body = {0};
     text_buffer logical = {0};
     const char *style = STYLE_RESET;
     conversation_kind kind = CONVERSATION_NONE;
-    for (size_t i = first + 1; i < end; i++) {
+    for (size_t i = first; i <= end; i++) {
         const display_line *row = &history->items[i];
-        if (row->card_role != 2) break;
+        if (row->card_role != 2) continue;
         if (!logical.length) {
-            style = row->accent_style ? row->accent_style : STYLE_RESET;
+            style = row->accent_style ? row->accent_style : row->style;
             kind = row->conversation_kind;
         }
         const char *part = row->source ? row->source : row->text;
         buffer_append(&logical, part, strlen(part));
         if (!row->soft_wrap) {
-            if (kind) conversation_wrap(&body, kind, 0, logical.data ? logical.data : "",
-                                        question_width(cols));
-            else question_wrap(&body, style, logical.data ? logical.data : "",
-                               question_width(cols));
+            retained_question_line(&body, kind, style, logical.data ? logical.data : "",
+                                   question_width(cols));
             buffer_clear(&logical);
         }
     }
     if (logical.length) {
-        if (kind) conversation_wrap(&body, kind, 0, logical.data, question_width(cols));
-        else question_wrap(&body, style, logical.data, question_width(cols));
+        retained_question_line(&body, kind, style, logical.data, question_width(cols));
     }
     question_card(target, &body, cols, 0);
     buffer_free(&logical);
@@ -1830,7 +1837,7 @@ static int retained_continues(const display_line *previous, const display_line *
  * and message boundaries remain separate records. */
 static size_t retained_group(display_lines *target, const display_lines *history,
                              size_t first, size_t limit, int cols) {
-    if (history->items[first].card_role == 1) {
+    if (history->items[first].card_first) {
         size_t end = retained_card(target, history, first, limit, cols);
         if (end != first) return end;
     }
@@ -1858,32 +1865,6 @@ static size_t retained_group(display_lines *target, const display_lines *history
     return end;
 }
 
-/* Only main-view output can enter the primary terminal scrollback. */
-static void history_flush(tui_app *app) {
-    tui_app *main = main_view(app);
-    if (main->overlay || app->hidden || app->side_chat) return;
-    if (app->flushed_rows == app->retained.count) return;
-    tui_app *active = main->active_view ? main->active_view : main;
-    erase_block(active);
-    terminal_update_begin();
-    if (app->history_omitted) {
-        write_text("...[earlier display output omitted]\r\n");
-        app->history_omitted = 0;
-    }
-    for (size_t i = app->flushed_rows; i < app->retained.count;) {
-        display_lines lines = {0};
-        i = retained_group(&lines, &app->retained, i, app->retained.count, active->cols);
-        for (size_t k = 0; k < lines.count; k++) {
-            write_display_line(&lines.items[k], active->cols);
-            write_text("\r\n");
-        }
-        lines_free(&lines);
-    }
-    terminal_update_end();
-    app->flushed_rows = app->retained.count;
-    main->dirty = main->redraw_urgent = 1;
-}
-
 static size_t retained_row_bytes(const display_line *row) {
     return strlen(row->text) + 1 + (row->source ? strlen(row->source) + 1 : 0);
 }
@@ -1900,8 +1881,8 @@ static void history_trim(tui_app *app, size_t bytes, size_t rows) {
             end++;
         }
         while (end < app->retained.count && app->retained.items[end].card_role &&
-               app->retained.items[end].card_role != 1) {
-            int bottom = app->retained.items[end].card_role == 3;
+               !app->retained.items[end].card_first) {
+            int bottom = app->retained.items[end].card_last;
             app->retained_bytes -= retained_row_bytes(&app->retained.items[end]);
             free(app->retained.items[end].text);
             free(app->retained.items[end].source);
@@ -1909,12 +1890,12 @@ static void history_trim(tui_app *app, size_t bytes, size_t rows) {
             if (bottom) break;
         }
         size_t drop = end - first;
-        if (end > app->flushed_rows) app->history_omitted = 1;
+        app->history_omitted = 1;
         memmove(app->retained.items + first, app->retained.items + end,
                 (app->retained.count - end) * sizeof(*app->retained.items));
         app->retained.count -= drop;
-        if (app->flushed_rows > first) app->flushed_rows = app->flushed_rows >= end ? app->flushed_rows - drop : first;
         if (app->view_end > first) app->view_end = app->view_end >= end ? app->view_end - drop : first;
+        if (!app->view_end) app->view_skip = 0;
     }
 }
 
@@ -1933,7 +1914,7 @@ static void history_retain(tui_app *app, const display_line *row) {
         buffer_free(&original);
         return;
     }
-    int following = app->view_end == app->retained.count;
+    int following = app->view_end == app->retained.count && !app->view_skip;
     history_trim(app, bytes, 1);
     lines_add(&app->retained, row->style, text, text_bytes - 1);
     display_line *copy = &app->retained.items[app->retained.count - 1];
@@ -1955,6 +1936,8 @@ static void history_retain(tui_app *app, const display_line *row) {
     copy->accent4_end = row->accent4_end;
     copy->accent4_style = row->accent4_style;
     copy->card_role = row->card_role;
+    copy->card_first = row->card_first;
+    copy->card_last = row->card_last;
     if (row->card_role && row->source) copy->source = copy_text(row->source);
     app->retained_bytes += bytes;
     if (following) app->view_end = app->retained.count;
@@ -1962,9 +1945,8 @@ static void history_retain(tui_app *app, const display_line *row) {
 }
 
 static void history_emit(tui_app *app, const display_lines *lines, size_t count, int gap) {
-    int visible = !app->hidden && !main_view(app)->overlay;
     int omit_card = 0;
-    if (count && lines->items[0].card_role == 1) {
+    if (count && lines->items[0].card_first) {
         size_t bytes = 0;
         for (size_t i = 0; i < count; i++) {
             size_t row_bytes = strlen(lines->items[i].text) + 1 +
@@ -1979,32 +1961,17 @@ static void history_emit(tui_app *app, const display_lines *lines, size_t count,
         if (omit_card) app->history_omitted = 1;
         else history_trim(app, bytes, count);
     }
-    if (visible) {
-        terminal_update_begin();
-        clear_block(app);
-    }
     for (size_t i = 0; i < count; i++) {
         if (!omit_card) history_retain(app, &lines->items[i]);
-        if (visible) {
-            write_display_line(&lines->items[i], app->cols);
-            write_text("\r\n");
-            app->flushed_rows = app->retained.count;
-        }
     }
     while (gap-- > 0) {
         display_line blank = { .text = "", .style = STYLE_RESET };
         history_retain(app, &blank);
-        if (visible) {
-            write_text("\r\n");
-            app->flushed_rows = app->retained.count;
-        }
     }
-    if (visible) terminal_update_end();
     app->dirty = app->redraw_urgent = 1;
 }
 
-/* Keep only the unfinished physical row in the live block. Completed rows
- * enter terminal history before another redraw can hide them. */
+/* Retain completed physical rows; only the unfinished row stays live. */
 static void stream_commit(tui_app *app, int finish) {
     if (!app->stream_kind) return;
     if (finish && app->stream_kind == CONVERSATION_ASSISTANT) {
@@ -2013,7 +1980,7 @@ static void stream_commit(tui_app *app, int finish) {
         if (end.length) append_text(&app->stream_text, &app->stream_text_len, end.data);
         buffer_free(&end);
     }
-    refresh_geometry(app);
+    terminal_size(app);
     display_lines lines = {0};
     if (app->stream_text_len)
         conversation_wrap(&lines, app->stream_kind, app->stream_continued,
@@ -2059,7 +2026,7 @@ static void stream_commit(tui_app *app, int finish) {
 
 static void conversation_print(tui_app *app, conversation_kind kind, const char *text) {
     stream_commit(app, 1);
-    refresh_geometry(app);
+    terminal_size(app);
     char *safe = conversation_safe(text);
     if (kind == CONVERSATION_ASSISTANT) {
         markdown_state md = {.columns = app->cols};
@@ -2115,22 +2082,112 @@ static void frame_border(display_lines *lines, const char *left, const char *rig
     buffer_free(&row);
 }
 
-static void overlay_history(tui_app *app, display_lines *page, size_t rows) {
+static size_t history_group_first(const display_lines *history, size_t end) {
+    size_t first = end - 1;
+    while (first && history->items[first].card_role && !history->items[first].card_first) first--;
+    while (first && retained_continues(&history->items[first - 1], &history->items[first])) first--;
+    return first;
+}
+
+static size_t history_group_end(const display_lines *history, size_t first) {
+    size_t end = first + 1;
+    if (history->items[first].card_role) {
+        while (end < history->count && !history->items[end - 1].card_last) end++;
+    } else {
+        while (end < history->count && retained_continues(&history->items[end - 1],
+                                                         &history->items[end])) end++;
+    }
+    return end;
+}
+
+static size_t history_group_rows(tui_app *app, size_t first, size_t end) {
+    display_lines wrapped = {0};
+    retained_group(&wrapped, &app->retained, first, end, app->cols);
+    size_t count = wrapped.count;
+    lines_free(&wrapped);
+    return count;
+}
+
+/* Message separators must not conceal the last output in a tiny viewport. */
+static size_t history_tail_end(const tui_app *app, size_t rows) {
+    size_t end = app->retained.count;
+    if (rows > 0 && rows < 3) {
+        size_t text_end = end;
+        while (text_end && !app->retained.items[text_end - 1].text[0] &&
+               !app->retained.items[text_end - 1].card_role) text_end--;
+        if (text_end && end - text_end >= rows) end = text_end + rows - 1;
+    }
+    return end;
+}
+
+static void history_scroll(tui_app *app, int direction, size_t step) {
     size_t end = app->view_end < app->retained.count ? app->view_end : app->retained.count;
+    size_t skip = app->view_skip;
+    size_t tail = history_tail_end(app, (size_t)app->history_rows);
+    if (direction < 0 && !skip && end == app->retained.count) end = tail;
+    if (end && skip) {
+        size_t count = history_group_rows(app, history_group_first(&app->retained, end), end);
+        if (skip >= count) skip = count ? count - 1 : 0;
+    }
+    while (step && direction < 0 && end) {
+        size_t first = history_group_first(&app->retained, end);
+        size_t count = history_group_rows(app, first, end);
+        size_t visible = count - skip;
+        if (step < visible) { skip += step; break; }
+        if (!first) { skip = count ? count - 1 : 0; break; }
+        step -= visible;
+        end = first;
+        skip = 0;
+    }
+    while (step && direction > 0) {
+        if (skip) {
+            size_t move = step < skip ? step : skip;
+            skip -= move;
+            step -= move;
+        } else if (end < app->retained.count) {
+            size_t next = history_group_end(&app->retained, end);
+            size_t count = history_group_rows(app, end, next);
+            end = next;
+            if (step < count) { skip = count - step; break; }
+            step -= count;
+        } else break;
+    }
+    if (direction > 0 && !skip && end >= tail) end = app->retained.count;
+    app->view_end = end;
+    app->view_skip = skip;
+}
+
+static int overlay_history(tui_app *app, display_lines *page, size_t rows) {
+    size_t end = app->view_end < app->retained.count ? app->view_end : app->retained.count;
+    size_t skip = app->view_skip;
+    if (end && skip) {
+        size_t count = history_group_rows(app, history_group_first(&app->retained, end), end);
+        if (skip >= count) skip = count ? count - 1 : 0;
+    } else skip = 0;
+    app->view_skip = skip;
+    if (!skip && end == app->retained.count) end = history_tail_end(app, rows);
     size_t first = end, height = 0;
-    while (first && height < rows) {
+    while (first && height < rows + skip) {
         display_lines wrapped = {0};
-        size_t last = first--;
-        while (first && app->retained.items[first].card_role &&
-               app->retained.items[first].card_role != 1) first--;
-        while (first && retained_continues(&app->retained.items[first - 1], &app->retained.items[first])) first--;
+        size_t last = first;
+        first = history_group_first(&app->retained, last);
         retained_group(&wrapped, &app->retained, first, last, app->cols);
         height += wrapped.count;
         lines_free(&wrapped);
     }
+    size_t before_brand = page->count;
+    if (!first && app->show_brand && !app->history_omitted) brand_lines(app, page);
+    int has_brand = page->count > before_brand;
     if (!first && app->history_omitted)
         lines_wrap(page, STYLE_MUTED, "", "...[earlier display output omitted]", app->cols, SIZE_MAX, NULL, NULL);
     for (size_t i = first; i < end;) i = retained_group(page, &app->retained, i, end, app->cols);
+    while (skip && page->count) {
+        skip--;
+        display_line *row = &page->items[--page->count];
+        free(row->text);
+        free(row->source);
+    }
+    return has_brand;
 }
 
 static void build_composer(tui_app *app, display_lines *composer, int content_cols,
@@ -2232,7 +2289,7 @@ static size_t append_menu(tui_app *app, display_lines *lines, size_t menu_rows,
 }
 
 static void render_block(tui_app *app) {
-    refresh_geometry(app);
+    terminal_size(app);
     stream_commit(app, 0);
     display_lines stream = {0};
     text_buffer preview = {0};
@@ -2293,7 +2350,7 @@ static void render_block(tui_app *app) {
         if (stream.count) lines_add(&stream, STYLE_RESET, "", 0);
         question_lines(app, &stream, &question_cursor_row, &question_cursor_col);
     }
-    if (!question && main_view(app)->overlay && app->view_end < app->retained.count)
+    if (!question && (app->view_end < app->retained.count || app->view_skip))
         lines_free(&stream);
     char *notice = shared_row(app);
     int status_rows = app->rows >= 2 ? 1 : 0;
@@ -2324,7 +2381,7 @@ static void render_block(tui_app *app) {
     size_t control_rows = control.count;
     if (control_rows > remaining - (remaining && stream.count ? 1u : 0u))
         control_rows = remaining - (remaining && stream.count ? 1u : 0u);
-    size_t gap_rows = remaining > control_rows + (question && stream.count ? 1u : 0u) &&
+    size_t gap_rows = remaining > control_rows + (stream.count || app->retained.count ? 1u : 0u) &&
         (stream.count || app->retained.count || control_rows) ? 1 : 0;
     size_t stream_rows = remaining - control_rows - gap_rows;
     if (stream_rows > stream.count) stream_rows = stream.count;
@@ -2342,8 +2399,9 @@ static void render_block(tui_app *app) {
     if (question && choices && stream_rows) {
         size_t selected = stream_first;
         for (size_t i = 0; i < stream.count; i++) {
-            if (stream.items[i].card_role == 2 && stream.items[i].accent_style &&
-                !strcmp(stream.items[i].accent_style, STYLE_SELECTED)) {
+            const display_line *row = &stream.items[i];
+            const char *style = row->accent_style ? row->accent_style : row->style;
+            if (row->card_role == 2 && !strcmp(style, STYLE_SELECTED)) {
                 selected = i;
                 break;
             }
@@ -2475,42 +2533,34 @@ static void render_block(tui_app *app) {
         free(status_line);
     }
     terminal_update_begin();
-    int history_rows = 0;
-    if (main_view(app)->overlay) {
-        history_rows = app->rows - (int)lines.count;
-        display_lines page = {0};
-        overlay_history(app, &page, (size_t)history_rows);
-        size_t shown = page.count < (size_t)history_rows ? page.count : (size_t)history_rows;
-        write_text("\x1b[H\x1b[2J");
-        for (int i = 0; i < history_rows; i++) {
-            if ((size_t)i >= (size_t)history_rows - shown)
-                write_display_line(&page.items[page.count - shown + (size_t)i - ((size_t)history_rows - shown)], app->cols);
-            write_text("\r\n");
-        }
-        lines_free(&page);
-        desired += history_rows;
-    } else clear_block(app);
+    int history_rows = app->rows - (int)lines.count;
+    app->history_rows = history_rows;
+    display_lines page = {0};
+    int has_brand = overlay_history(app, &page, (size_t)history_rows);
+    size_t shown = page.count < (size_t)history_rows ? page.count : (size_t)history_rows;
+    /* Keep a fully visible welcome banner at the top of the viewport. */
+    size_t padding = has_brand && page.count == shown ? 0 : (size_t)history_rows - shown;
+    write_text("\x1b[H\x1b[2J");
+    for (int i = 0; i < history_rows; i++) {
+        if ((size_t)i >= padding && (size_t)i - padding < shown)
+            write_display_line(&page.items[page.count - shown + (size_t)i - padding], app->cols);
+        write_text("\r\n");
+    }
+    lines_free(&page);
+    desired += history_rows;
     for (size_t i = 0; i < lines.count; i++) {
         write_display_line(&lines.items[i], app->cols);
         if (i + 1 < lines.count) write_text("\r\n");
     }
-    int printed = history_rows + (int)lines.count;
-    int up = printed - 1 - desired;
-    if (up > 0) {
-        char move[32];
-        snprintf(move, sizeof(move), "\x1b[%dA", up);
-        write_text(move);
-    }
-    write_text("\r");
+    char position[48];
+    snprintf(position, sizeof(position), "\x1b[%d;1H", desired + 1);
+    write_text(position);
     if (cursor_col > 0) {
         char move[32];
         snprintf(move, sizeof(move), "\x1b[%dC", cursor_col);
         write_text(move);
     }
-    terminal_update_end();
-    if (choices) write_text("\x1b[?25l");
-    app->block_lines = printed;
-    app->block_cursor_row = desired;
+    terminal_update_end(!choices);
     app->dirty = 0;
     app->redraw_urgent = 0;
     app->last_render_ms = monotonic_ms();
@@ -2523,7 +2573,7 @@ static void render_block(tui_app *app) {
 
 static void transcript_literal(tui_app *app, const char *style, const char *text, int gap) {
     stream_commit(app, 1);
-    refresh_geometry(app);
+    terminal_size(app);
     display_lines lines = {0};
     lines_wrap(&lines, style, "", text, app->cols, SIZE_MAX, NULL, NULL);
     history_emit(app, &lines, lines.count, gap);
@@ -2762,7 +2812,7 @@ static void tool_output(tui_app *app, const char *text) {
     if (!text || !*text || !app->tool_name || strcmp(app->tool_name, "bash") ||
         !tool_body_visible(app, "bash")) return;
     if (!app->tool_streamed_bytes) {
-        refresh_geometry(app);
+        terminal_size(app);
         display_lines lines = {0};
         tool_action_lines(app, &lines, TOOL_RUNNING, NULL);
         history_emit(app, &lines, lines.count, 0);
@@ -2801,7 +2851,7 @@ static void tool_result(tui_app *app, const oca_core_event *event) {
                 if (body_length) body_length--; /* Separator before execution metadata. */
             }
         }
-        refresh_geometry(app);
+        terminal_size(app);
         display_lines lines = {0};
         if (!app->tool_streamed_bytes)
             tool_action_lines(app, &lines, bash ? TOOL_RUNNING : state, event->text);
@@ -2847,7 +2897,7 @@ static void tool_result(tui_app *app, const oca_core_event *event) {
     app->tool_streamed_bytes = 0;
 }
 
-/* Append completed rows to terminal-owned scrollback. */
+/* Append completed rows to the conversation's retained display history. */
 static void transcript(tui_app *app, const char *style, const char *format, ...) {
     if (!format) return;
     stream_commit(app, 1);
@@ -2869,10 +2919,6 @@ static void transcript(tui_app *app, const char *style, const char *format, ...)
     free(text);
 }
 
-static void write_spaces(int count) {
-    while (count-- > 0) write_text(" ");
-}
-
 static void terminal_title(tui_app *app) {
     const char *term = getenv("TERM");
     if (!term || !strcmp(term, "dumb")) return;
@@ -2890,34 +2936,35 @@ static void terminal_title(tui_app *app) {
     free(safe);
 }
 
-static void brand_border(const char *left, const char *right, int width) {
-    write_text(STYLE_ACCENT);
-    write_text(left);
-    for (int i = 0; i < width; i++) write_text("─");
-    write_text(right);
-    write_text(STYLE_RESET "\r\n");
-}
-
-static void print_brand(tui_app *app) {
-    terminal_size(app);
+/* Rebuild the banner at the current width instead of retaining its borders. */
+static void brand_lines(tui_app *app, display_lines *lines) {
     int title_width = text_columns("OCA 🪿");
     if (app->cols < title_width + 4 || app->rows < 12) return;
     char *description = safe_clip(app->workspace ? app->workspace : "", app->cols - 4);
     int path_width = text_columns(description);
     int inside = (path_width > title_width ? path_width : title_width) + 2;
-    terminal_update_begin();
-    brand_border("╭", "╮", inside);
-    write_text(STYLE_ACCENT "│ " STYLE_RESET "\x1b[1mOCA" STYLE_RESET " 🪿");
-    write_spaces(inside - 1 - title_width);
-    write_text(STYLE_ACCENT "│" STYLE_RESET "\r\n" STYLE_ACCENT "│");
-    write_spaces(inside);
-    write_text(STYLE_ACCENT "│" STYLE_RESET "\r\n" STYLE_ACCENT "│ " STYLE_MUTED);
-    write_text(description);
-    write_spaces(inside - 1 - path_width);
-    write_text(STYLE_ACCENT "│" STYLE_RESET "\r\n");
-    brand_border("╰", "╯", inside);
-    terminal_update_end();
+    frame_border(lines, "╭", "╮", inside + 2);
+    text_buffer row = {0};
+    const char *content[] = {STYLE_RESET STYLE_BOLD "OCA" STYLE_RESET " 🪿", "", description};
+    const int widths[] = {title_width, 0, path_width};
+    for (size_t i = 0; i < 3; i++) {
+        buffer_clear(&row);
+        buffer_append(&row, "│ ", strlen("│ "));
+        const char *style = i == 2 ? STYLE_MUTED : STYLE_RESET;
+        buffer_append(&row, style, strlen(style));
+        buffer_append(&row, content[i], strlen(content[i]));
+        for (int k = 0; k < inside - 1 - widths[i]; k++) buffer_append(&row, " ", 1);
+        buffer_append(&row, STYLE_ACCENT "│", strlen(STYLE_ACCENT "│"));
+        lines_add(lines, STYLE_ACCENT, row.data, row.length);
+    }
+    buffer_free(&row);
+    frame_border(lines, "╰", "╯", inside + 2);
     free(description);
+}
+
+static void print_brand(tui_app *app) {
+    terminal_size(app);
+    app->show_brand = app->cols >= text_columns("OCA 🪿") + 4 && app->rows >= 12;
 }
 
 static void print_startup_context(tui_app *app) {
@@ -2928,7 +2975,6 @@ static void print_startup_context(tui_app *app) {
 }
 
 static void welcome_reset(tui_app *app) {
-    erase_block(app);
     input_clear(app);
     app->notice[0] = 0;
     app->restore_pending = app->welcome_pending = 0;
@@ -3116,7 +3162,7 @@ static void input_vertical(tui_app *app, int direction) {
         if (app->menu != MENU_INTERACTION) history_move(app, direction);
         return;
     }
-    refresh_geometry(app);
+    terminal_size(app);
     char *notice = shared_row(app);
     int available = app->rows - (app->rows >= 2) - (notice && app->rows >= 3);
     free(notice);
@@ -3289,20 +3335,10 @@ static void interaction_restore(tui_app *app) {
 
 static void question_wrap(display_lines *lines, const char *style,
                           const char *text, int cols) {
-    const char *at = text;
-    for (;;) {
-        size_t length = strcspn(at, "\n");
-        char *part = checked_realloc(NULL, length + 1);
-        memcpy(part, at, length);
-        part[length] = 0;
-        size_t first = lines->count;
-        lines_wrap(lines, style, "", part, cols, SIZE_MAX, NULL, NULL);
-        for (size_t i = first; i + 1 < lines->count; i++) lines->items[i].soft_wrap = 1;
-        free(part);
-        at += length;
-        if (!*at) break;
-        at++;
-    }
+    size_t first = lines->count;
+    /* Keep source bytes when a narrow row substitutes a wide grapheme. */
+    conversation_wrap(lines, CONVERSATION_ANSWER, 0, text, cols);
+    for (size_t i = first; i < lines->count; i++) lines->items[i].style = style;
 }
 
 static void question_heading(display_lines *lines, const char *question, int cols) {
@@ -3335,11 +3371,18 @@ static int question_width(int cols) {
 
 static void question_card(display_lines *lines, const display_lines *body, int cols, int active) {
     if (cols < 8) {
+        size_t first = lines->count;
         lines_copy_range(lines, body, 0, body->count);
+        for (size_t i = first; i < lines->count; i++) lines->items[i].card_role = 2;
+        if (body->count) {
+            lines->items[first].card_first = 1;
+            lines->items[lines->count - 1].card_last = 1;
+        }
         return;
     }
     frame_border(lines, "╭", "╮", cols);
     lines->items[lines->count - 1].card_role = 1;
+    lines->items[lines->count - 1].card_first = 1;
     lines->items[lines->count - 1].style = active ? STYLE_ACCENT : STYLE_MUTED;
     for (size_t i = 0; i < body->count; i++) {
         const display_line *source = &body->items[i];
@@ -3363,6 +3406,7 @@ static void question_card(display_lines *lines, const display_lines *body, int c
     }
     frame_border(lines, "╰", "╯", cols);
     lines->items[lines->count - 1].card_role = 3;
+    lines->items[lines->count - 1].card_last = 1;
     lines->items[lines->count - 1].style = active ? STYLE_ACCENT : STYLE_MUTED;
 }
 
@@ -3401,7 +3445,7 @@ static void question_lines(tui_app *app, display_lines *lines, int *cursor_row, 
     for (size_t i = 0; i < question->option_count; i++) {
         char *safe = conversation_safe(question->options[i]);
         text_buffer option = {0};
-        buffer_append(&option, "  ", 2);
+        buffer_append(&option, "  ", width >= 3 ? 2 : (size_t)(width - 1));
         buffer_append(&option, safe, strlen(safe));
         question_wrap(&body, i == app->menu_selection ? STYLE_SELECTED : STYLE_RESET,
                       option.data, width);
@@ -3635,7 +3679,7 @@ static void goal_event(tui_app *app, const oca_core_event *event) {
     buffer_append(&text, STYLE_MUTED, strlen(STYLE_MUTED));
     buffer_append(&text, STYLE_RESET, strlen(STYLE_RESET));
     display_lines lines = {0};
-    conversation_wrap(&lines, CONVERSATION_NONE, 0, text.data, app->cols);
+    conversation_wrap(&lines, CONVERSATION_BODY, 0, text.data, app->cols);
     history_emit(app, &lines, lines.count, 1);
     lines_free(&lines);
     buffer_free(&text);
@@ -3714,7 +3758,7 @@ static void handle_event(tui_app *app, oca_core_event *event) {
             stream_clear(app);
             side_close(app);
             lines_free(&app->retained);
-            app->retained_bytes = app->flushed_rows = app->view_end = 0;
+            app->retained_bytes = app->view_end = app->view_skip = 0;
             app->history_omitted = 0;
             if (event->session_new) main_view(app)->welcome_pending = 1;
         }
@@ -4081,6 +4125,28 @@ static void cycle_reasoning(tui_app *app, int direction) {
  * Input decoding and lifecycle
  * ========================================================================== */
 
+/* SGR mouse reports keep wheel input distinct from cursor keys. Clicks and
+ * releases are consumed without editing the draft or changing menu choices. */
+static void mouse_report(tui_app *app) {
+    const char *at = app->escape + 3;
+    unsigned values[3] = {0};
+    for (size_t i = 0; i < 3; i++) {
+        if (!isdigit((unsigned char)*at)) return;
+        while (isdigit((unsigned char)*at)) {
+            if (values[i] > 6553 || (values[i] == 6553 && *at > '5')) return;
+            values[i] = values[i] * 10 + (unsigned)(*at++ - '0');
+        }
+        if (i < 2 && *at++ != ';') return;
+    }
+    if ((*at != 'M' && *at != 'm') || at[1] || !values[1] || !values[2]) return;
+    unsigned button = values[0] & ~28u; /* Shift, Alt, Ctrl do not change direction. */
+    if (*at == 'M' && (button == 64 || button == 65) &&
+        app->menu == MENU_NONE && app->history_rows > 0) {
+        history_scroll(app, button == 64 ? -1 : 1, 3);
+        app->dirty = app->redraw_urgent = 1;
+    }
+}
+
 static int escape_match(const char *text, size_t len, int complete) {
     static const char *const sequences[] = {
         "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[H", "\x1b[F",
@@ -4109,17 +4175,9 @@ static int escape_action(tui_app *app) {
     if (!strcmp(sequence, "\x1b[47;5u")) {
         view_switch(app);
     } else if (!strcmp(sequence, "\x1b[5~") || !strcmp(sequence, "\x1b[6~")) {
-        if (main_view(app)->overlay && app->menu == MENU_NONE) {
-            size_t step = app->rows > 8 ? (size_t)app->rows - 8 : 1;
-            size_t first = step < app->retained.count ? step : app->retained.count;
-            if (!strcmp(sequence, "\x1b[5~")) {
-                size_t end = app->view_end > step ? app->view_end - step : 0;
-                app->view_end = end > first ? end : first;
-            } else {
-                size_t remaining = app->retained.count - app->view_end;
-                app->view_end += step < remaining ? step : remaining;
-            }
-        }
+        if (app->menu == MENU_NONE && app->history_rows > 0)
+            history_scroll(app, !strcmp(sequence, "\x1b[5~") ? -1 : 1,
+                           app->history_rows > 1 ? (size_t)app->history_rows - 1 : 1);
     } else if (!strcmp(sequence, "\x1b[A")) {
         if (app->menu == MENU_INTERACTION && app->interaction_details) input_vertical(app, -1);
         else if (app->menu != MENU_NONE) menu_move(app, -1);
@@ -4320,6 +4378,11 @@ static void input_utf8_byte(tui_app *app, unsigned char byte) {
 }
 
 static void escape_fallback(tui_app *app) {
+    if (app->escape_len >= 3 && !memcmp(app->escape, "\x1b[<", 3)) {
+        app->escape_len = 0;
+        app->escape_deadline_ms = 0;
+        return;
+    }
     unsigned char replay[ESCAPE_MAX];
     size_t count = app->escape_len > 1 ? app->escape_len - 1 : 0;
     if (count) memcpy(replay, app->escape + 1, count);
@@ -4330,6 +4393,19 @@ static void escape_fallback(tui_app *app) {
 }
 
 static void feed_escape(tui_app *app, unsigned char byte) {
+    if (app->escape_len >= 3 && !memcmp(app->escape, "\x1b[<", 3)) {
+        if (app->escape_len + 1 < sizeof(app->escape)) {
+            app->escape[app->escape_len++] = (char)byte;
+            app->escape[app->escape_len] = '\0';
+            if (byte == 'M' || byte == 'm') mouse_report(app);
+        }
+        /* Drain invalid parameters too, so their tail cannot enter the draft. */
+        if ((byte >= 0x40 && byte <= 0x7e) || byte < 0x20) {
+            app->escape_len = 0;
+            app->escape_deadline_ms = 0;
+        }
+        return;
+    }
     if (app->escape_len + 1 >= sizeof(app->escape)) {
         app->escape_len = 0;
         app->escape_deadline_ms = 0;
@@ -4343,6 +4419,7 @@ static void feed_escape(tui_app *app, unsigned char byte) {
         app->escape_deadline_ms = 0;
         return;
     }
+    if (app->escape_len == 3 && !memcmp(app->escape, "\x1b[<", 3)) return;
     if (!escape_prefix(app->escape, app->escape_len)) escape_fallback(app);
 }
 
@@ -4533,9 +4610,7 @@ static void app_free(tui_app *app) {
  * ========================================================================== */
 
 static void view_restore(tui_app *app) {
-    refresh_geometry(app);
-    if (!main_view(app)->overlay) erase_block(app);
-    app->block_lines = app->block_cursor_row = 0;
+    terminal_size(app);
     main_view(app)->restore_pending = 0;
     app->dirty = app->redraw_urgent = 1;
 }
@@ -4544,8 +4619,6 @@ static void view_select(tui_app *main, tui_app *target) {
     tui_app *previous = main->active_view;
     if (previous == target) return;
     stream_commit(previous, 0);
-    if (!main->overlay) erase_block(previous);
-    previous->block_lines = previous->block_cursor_row = 0;
     previous->hidden = 1;
     target->hidden = 0;
     main->active_view = target;
@@ -4588,13 +4661,6 @@ static void side_open(tui_app *app, const char *message) {
         side->workspace = side->owned_workspace;
         side->signal_pipe[0] = side->signal_pipe[1] = -1;
         main->side_view = side;
-        if (!main->overlay) {
-            stream_commit(main, 0);
-            erase_block(main);
-            write_text("\x1b[?1049h\x1b[H\x1b[2J");
-            main->terminal.alternate_screen = 1;
-            main->overlay = 1;
-        }
     }
     tui_app *side = main->side_view;
     view_select(main, side);
@@ -4627,19 +4693,6 @@ static void side_reap(tui_app *main) {
     app_free(side);
     free(side);
     main->side_view = NULL;
-    if (main->view_end == main->retained.count) overlay_leave(main);
-    main->dirty = main->redraw_urgent = 1;
-}
-
-static void overlay_leave(tui_app *main) {
-    if (!main->overlay) return;
-    write_text("\x1b[?1049l");
-    main->terminal.alternate_screen = 0;
-    main->overlay = 0;
-    main->hidden = 0;
-    main->active_view = main;
-    main->block_lines = main->block_cursor_row = 0;
-    history_flush(main);
     main->dirty = main->redraw_urgent = 1;
 }
 
@@ -4738,7 +4791,6 @@ int oca_tui_run(oca_core *core, const char *workspace, const char *initial_promp
         drain_events(&app);
         if (app.side_view) drain_events(app.side_view);
         side_reap(&app);
-        if (app.overlay && !app.side_view && app.view_end == app.retained.count) overlay_leave(&app);
         if (app.welcome_pending && !app.side_view) welcome_reset(&app);
         if (!app.running || signal_exit) break;
         tui_app *active = app.active_view;
@@ -4780,7 +4832,6 @@ int oca_tui_run(oca_core *core, const char *workspace, const char *initial_promp
     if (signal_exit || input_closed) oca_core_cancel(core);
     if (app.side_view) {
         oca_core_stop(app.side_view->core);
-        if (app.active_view == app.side_view) erase_block(app.side_view);
         oca_core_destroy(app.side_view->core);
         app_free(app.side_view);
         free(app.side_view);
@@ -4788,10 +4839,7 @@ int oca_tui_run(oca_core *core, const char *workspace, const char *initial_promp
     }
     app.hidden = 0;
     app.active_view = &app;
-    overlay_leave(&app);
     stream_commit(&app, 1);
-    history_flush(&app);
-    erase_block(&app);
     result = app.failed ? 1 : 0;
 cleanup:
     terminal_restore();

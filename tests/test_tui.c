@@ -38,11 +38,13 @@ typedef struct {
     int autowrap;
     int pending_wrap;
     int cursor_visible;
+    int mouse_tracking, mouse_sgr;
     int bracketed_paste;
     int alternate_screen;
     int nondefault_margin;
     int parser;
     int foreground;
+    char selected_ascii;
     int check_colors;
     size_t frame_glyphs, queue_separators, user_markers, assistant_markers;
     char csi[CSI_MAX];
@@ -152,6 +154,8 @@ static void vt_linefeed(virtual_terminal *terminal) {
 
 static void vt_put(virtual_terminal *terminal, char value, int width) {
     if (width <= 0) return;
+    if (!terminal->selected_ascii && terminal->foreground == 2 &&
+        value >= '!' && value <= '~' && value != '#') terminal->selected_ascii = value;
     if (terminal->pending_wrap && terminal->autowrap) {
         terminal->col = 0;
         vt_linefeed(terminal);
@@ -260,6 +264,8 @@ static void vt_csi(virtual_terminal *terminal, unsigned char final) {
         else if (first == 7) terminal->autowrap = enabled;
         else if (first == 25) terminal->cursor_visible = enabled;
         else if (first == 2004) terminal->bracketed_paste = enabled;
+        else if (first == 1000) terminal->mouse_tracking = enabled;
+        else if (first == 1006) terminal->mouse_sgr = enabled;
         else if (first == 1049 && enabled != terminal->alternate_screen) {
             if (enabled) {
                 terminal->primary_cells = terminal->cells;
@@ -351,8 +357,8 @@ static void vt_feed(virtual_terminal *terminal, const char *bytes, size_t length
                     terminal->saved_row = terminal->row;
                     terminal->saved_col = terminal->col;
                 } else if (byte == '8') {
-                    terminal->row = terminal->saved_row;
-                    terminal->col = terminal->saved_col;
+                    terminal->row = terminal->saved_row < terminal->rows ? terminal->saved_row : terminal->rows - 1;
+                    terminal->col = terminal->saved_col < terminal->cols ? terminal->saved_col : terminal->cols - 1;
                 }
                 terminal->parser = 0;
             }
@@ -429,6 +435,10 @@ static void vt_resize(virtual_terminal *terminal, int rows, int cols) {
     terminal->rows = rows;
     terminal->cols = cols;
     terminal->row -= shift;
+    terminal->saved_row -= shift;
+    if (terminal->saved_row < 0) terminal->saved_row = 0;
+    if (terminal->saved_row >= rows) terminal->saved_row = rows - 1;
+    if (terminal->saved_col >= cols) terminal->saved_col = cols - 1;
     if (terminal->row < 0) terminal->row = 0;
     if (terminal->row >= rows) terminal->row = rows - 1;
     if (terminal->col >= cols) terminal->col = cols - 1;
@@ -657,13 +667,15 @@ static int app_wait_queue_legend(app_run *run, int milliseconds) {
     return 0;
 }
 
+static int app_history_contains(app_run *run, const char *needle);
+
 static int app_wait_anywhere(app_run *run, const char *needle, int milliseconds) {
     long long deadline = now_ms() + milliseconds;
     while (now_ms() < deadline) {
         if (vt_contains(&run->terminal, needle)) return 1;
         app_pump(run, 25);
     }
-    return vt_contains(&run->terminal, needle);
+    return app_history_contains(run, needle);
 }
 
 static int app_wait_raw(app_run *run, const char *needle, int milliseconds) {
@@ -746,6 +758,22 @@ static void app_send_text(app_run *run, const char *text) {
     app_send(run, text, strlen(text));
 }
 
+/* Search OCA's retained history through its actual navigation keys, then
+ * return to the latest output. Native terminal history stays untouched. */
+static int app_history_contains(app_run *run, const char *needle) {
+    if (vt_rows_contain(&run->terminal, needle)) return 1;
+    int found = 0, pages = 0;
+    /* Consecutive blank history rows can produce identical visible pages. */
+    for (; pages < 200 && !found; pages++) {
+        app_send_text(run, "\x1b[5~");
+        app_settle(run);
+        found = vt_rows_contain(&run->terminal, needle);
+    }
+    for (int i = 0; i <= pages; i++) app_send_text(run, "\x1b[6~");
+    app_settle(run);
+    return found;
+}
+
 static void app_resize(app_run *run, int rows, int cols) {
     struct winsize size = { .ws_row = (unsigned short)rows,
                             .ws_col = (unsigned short)cols };
@@ -785,6 +813,7 @@ static void app_assert_restored(app_run *run) {
     assert(run->raw && strstr(run->raw, "\x1b[?2004l"));
     assert(run->raw && strstr(run->raw, "\x1b[?7h"));
     assert(!run->terminal.bracketed_paste);
+    assert(!run->terminal.mouse_tracking && !run->terminal.mouse_sgr);
     assert(run->terminal.cursor_visible);
     assert(run->terminal.autowrap);
     assert(!run->terminal.alternate_screen);
@@ -941,12 +970,12 @@ static void test_question_details(const char *executable) {
     assert(app_wait_current(&run, "Answer: None of the above", 3000));
     app_send_text(&run, "\x0f");
     app_settle(&run);
-    assert(!run.terminal.alternate_screen && !strstr(run.raw, "Tool output"));
-    assert(vt_contains(&run.terminal, "Answer: red"));
-    assert(vt_contains(&run.terminal, "Details: warm colors"));
-    assert(vt_contains(&run.terminal, "! note"));
-    assert(vt_contains(&run.terminal, "Answer: None of the above"));
-    assert(vt_contains(&run.terminal, "Details: ! custom size"));
+    assert(run.terminal.alternate_screen && !strstr(run.raw, "Tool output"));
+    assert(app_history_contains(&run, "Answer: red"));
+    assert(app_history_contains(&run, "Details: warm colors"));
+    assert(app_history_contains(&run, "! note"));
+    assert(app_history_contains(&run, "Answer: None of the above"));
+    assert(app_history_contains(&run, "Details: ! custom size"));
     assert(app_wait_current(&run, "# keep-draft", 3000));
     app_send_text(&run, "\x03/btw\r\r");
     assert(app_wait_current(&run, "Temporary chat", 3000));
@@ -1136,6 +1165,172 @@ static void test_resize_drag(const char *executable) {
     environment_destroy(&environment);
 }
 
+/* Wait for the complete frame; the first PTY read may end inside an escape. */
+static void app_resize_frame(app_run *run, int rows, int cols) {
+    size_t at = run->raw_len;
+    const char *end = run->terminal.cursor_visible ? "\x1b[?7h\x1b[?25h" : "\x1b[?7h\x1b[?25l";
+    struct winsize before, size = {.ws_row = (unsigned short)rows,
+                                   .ws_col = (unsigned short)cols};
+    assert(!ioctl(run->slave, TIOCGWINSZ, &before));
+    run->terminal.selected_ascii = 0;
+    vt_resize(&run->terminal, rows, cols);
+    assert(!ioctl(run->slave, TIOCSWINSZ, &size));
+    /* TIOCSWINSZ signals this PTY's foreground child. A second signal can
+     * queue a duplicate frame that arrives after the next simulated resize. */
+    if (before.ws_row == size.ws_row && before.ws_col == size.ws_col)
+        assert(!kill(run->child, SIGWINCH));
+    assert(app_wait_raw_after(run, at, end, 3000));
+}
+
+static int cursor_character_matches(const virtual_terminal *terminal, char expected, int frame) {
+    if (terminal->cells[(size_t)terminal->row * (size_t)terminal->cols +
+                        (size_t)terminal->col] != expected || !terminal->cursor_visible ||
+        !terminal->alternate_screen || (terminal->rows >= 2 && terminal->row >= terminal->rows - 1))
+        return 0;
+    if (frame && terminal->cols >= 8 && terminal->rows >= 5) {
+        int borders = 0;
+        for (int row = 0; row < terminal->rows; row++) {
+            char *text = vt_row_copy(terminal, row);
+            if ((int)strlen(text) == terminal->cols && strspn(text, "#") == strlen(text)) borders++;
+            free(text);
+        }
+        if (borders != 2) return 0;
+    }
+    return 1;
+}
+
+static void assert_cursor_character(app_run *run, char expected, int frame) {
+    /* A timer or input redraw may already be in flight at TIOCSWINSZ. Its
+     * terminator does not acknowledge the new geometry; await that layout. */
+    long long deadline = now_ms() + 3000;
+    while (!cursor_character_matches(&run->terminal, expected, frame) && now_ms() < deadline)
+        app_pump(run, 10);
+    if (!cursor_character_matches(&run->terminal, expected, frame)) {
+        fprintf(stderr, "resize %dx%d: cursor (%d,%d), expected '%c'\n",
+                run->terminal.rows, run->terminal.cols, run->terminal.row, run->terminal.col, expected);
+        for (int row = 0; row < run->terminal.rows; row++) {
+            char *text = vt_row_copy(&run->terminal, row);
+            fprintf(stderr, "%02d: [%s]\n", row, text);
+            free(text);
+        }
+        assert(0);
+    }
+}
+
+static void test_resize_restore(const char *executable) {
+    test_environment environment;
+    environment_create(&environment);
+    app_run run;
+    app_start(&run, executable, &environment, 24, 80);
+    run.terminal.row = 12;
+    run.terminal.col = 7;
+    memcpy(run.terminal.cells, "shell-before-oca", sizeof("shell-before-oca") - 1);
+    assert(app_wait_current(&run, "Ask OCA anything", 5000));
+    app_paste_text(&run, "draft-first\ndraft-middle\ndraft-last", 0);
+    assert(app_wait_cursor(&run, "draft-last", 14, 3000));
+    app_settle(&run);
+    for (int rows = 40; rows >= 1; rows--) {
+        app_resize_frame(&run, rows, 1 + (rows * 29) % 160);
+        assert(run.terminal.alternate_screen && !run.terminal.history_count);
+        app_resize_frame(&run, 24, 80);
+        assert(app_wait_cursor(&run, "draft-last", 14, 3000));
+        assert_cursor_character(&run, ' ', 1);
+    }
+    app_quit_without_save(&run);
+    assert(!run.terminal.alternate_screen);
+    assert(vt_rows_contain(&run.terminal, "shell-before-oca"));
+    assert(run.terminal.row == 12 && run.terminal.col == 7);
+    assert(!run.terminal.history_count);
+    assert(!vt_rows_contain(&run.terminal, "draft-"));
+    app_close(&run);
+    environment_destroy(&environment);
+}
+
+static void test_resize_matrix(const char *executable) {
+    test_environment environment;
+    environment_create(&environment);
+    app_run run;
+    app_start(&run, executable, &environment, 10, 80);
+    assert(app_wait_current(&run, "Ask OCA anything", 5000));
+    app_resize_frame(&run, 24, 80);
+    app_paste_text(&run, "before\ncursor 界 é 🙂 Xtail\nlast", 0);
+    assert(app_wait_current(&run, "last", 3000));
+    for (int i = 0; i < 10; i++) app_send_text(&run, "\x1b[D");
+    assert(app_wait_cursor(&run, "Xtail", 19, 3000));
+    app_settle(&run);
+    /* Exhaust every small geometry, in both horizontal directions. The cursor
+     * must keep pointing to X even when its logical row is mostly offscreen. */
+    for (int rows = 1; rows <= 40; rows++) {
+        for (int step = 1; step <= 160; step++) {
+            int cols = rows % 2 ? step : 161 - step;
+            app_resize_frame(&run, rows, cols);
+            assert_cursor_character(&run, 'X', 1);
+        }
+    }
+    app_resize_frame(&run, 24, 80);
+    assert(app_wait_cursor(&run, "Xtail", 19, 3000));
+    app_send_text(&run, "Y");
+    assert(app_wait_current(&run, "YXtail", 3000));
+    app_send_text(&run, "\x1b[F");
+    assert(app_wait_cursor(&run, "last", 8, 3000));
+    for (int rows = 40; rows >= 1; rows--) {
+        app_resize_frame(&run, rows, 80);
+        assert_cursor_character(&run, ' ', 1);
+    }
+    app_resize_frame(&run, 24, 80);
+    assert(app_wait_cursor(&run, "last", 8, 3000));
+    app_send_text(&run, "\x03/");
+    assert(app_wait_current(&run, "/help", 3000));
+    app_settle(&run);
+    for (int cols = 160; cols >= 1; cols--) {
+        int rows = 1 + cols % 40;
+        app_resize_frame(&run, rows, cols);
+        if (cols >= 8 && rows >= 8) assert(run.terminal.selected_ascii == '/');
+        int resume_rows = 0;
+        for (int row = 0; row < rows; row++) {
+            char *text = vt_row_copy(&run.terminal, row);
+            if (strstr(text, "/resume")) resume_rows++;
+            free(text);
+        }
+        assert(resume_rows <= 1);
+    }
+    app_resize_frame(&run, 24, 80);
+    assert(app_wait_current(&run, "/help", 3000));
+    app_send_text(&run, "\x1b");
+    assert(app_wait_current_absent(&run, "/resume", 3000));
+    app_send_text(&run, "\x03" "fixture:ask\rkeep-draft");
+    assert(app_wait_current(&run, "Which color?", 3000));
+    app_settle(&run);
+    for (int selection = 0; selection < 2; selection++) {
+        char selected = selection ? 'b' : 'r';
+        for (int rows = 1; rows <= 12; rows++) {
+            for (int cols = 1; cols <= 80; cols++) {
+                app_resize_frame(&run, rows, cols);
+                assert(run.terminal.selected_ascii == selected);
+                assert(!run.terminal.cursor_visible);
+            }
+        }
+        app_resize_frame(&run, 24, 80);
+        app_send_text(&run, "\x1b[B");
+        app_settle(&run);
+    }
+    app_send_text(&run, "\tdetail Xtail");
+    assert(app_wait_current(&run, "detail Xtail", 3000));
+    for (int i = 0; i < 5; i++) app_send_text(&run, "\x1b[D");
+    assert(app_wait_cursor(&run, "detail Xtail", 11, 3000));
+    for (int cols = 1; cols <= 160; cols++) {
+        app_resize_frame(&run, 1 + cols % 40, cols);
+        /* Questions use their own frame, so check the edit position directly. */
+        assert_cursor_character(&run, 'X', 0);
+    }
+    app_resize_frame(&run, 24, 80);
+    app_send_text(&run, "\x1b");
+    assert(app_wait_current(&run, "keep-draft", 3000));
+    app_quit_without_save(&run);
+    app_close(&run);
+    environment_destroy(&environment);
+}
+
 static void test_vertical_input(const char *executable) {
     test_environment environment;
     environment_create(&environment);
@@ -1272,15 +1467,25 @@ static void test_brand(const char *executable) {
     assert(app_wait_current(&run, "Ask OCA anything", 5000));
     assert(app_wait_raw(&run, "—/245760", 3000));
     app_settle(&run);
+    assert(vt_find_row(&run.terminal, "OCA") == 1);
+    assert(vt_find_row(&run.terminal, environment.workspace) == 3);
+    const int sizes[][2] = {{48, 120}, {12, 50}, {2, 8}, {24, 80}};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        app_resize(&run, sizes[i][0], sizes[i][1]);
+        app_settle(&run);
+        if (sizes[i][0] >= 12) assert(vt_find_row(&run.terminal, "OCA") == 1);
+    }
     assert(vt_contains(&run.terminal, environment.workspace));
     assert(!vt_contains(&run.terminal, "Project context:") && !strstr(run.raw, "[AGENTS.md]"));
-    assert(vt_history_contains(&run.terminal, "shell-marker"));
+    assert(run.terminal.primary_cells &&
+           !memcmp(run.terminal.primary_cells, "shell-marker", strlen("shell-marker")));
+    assert(!run.terminal.history_count);
     assert(vt_find_last_row(&run.terminal, "kimi-k3") ==
            vt_find_row(&run.terminal, "Ask OCA anything") + 2);
     assert(run.terminal.row == vt_find_row(&run.terminal, "Ask OCA anything"));
     assert(run.terminal.col == 4);
-    assert(!bytes_contain(run.raw, run.raw_len, "\x1b[?1049h", 8));
-    assert(!run.terminal.alternate_screen);
+    assert(bytes_contain(run.raw, run.raw_len, "\x1b[?1049h", 8));
+    assert(run.terminal.alternate_screen);
     assert(!run.terminal.nondefault_margin);
     assert(run.terminal.bracketed_paste);
     char *status = vt_row_copy(&run.terminal, vt_find_last_row(&run.terminal, "kimi-k3"));
@@ -1309,6 +1514,9 @@ static void test_brand(const char *executable) {
     assert(app_wait_current(&run, "100/245760", 3000));
     assert(run.terminal.user_markers && !run.terminal.assistant_markers);
     app_quit_without_save(&run);
+    assert(vt_rows_contain(&run.terminal, "shell-marker"));
+    assert(run.terminal.row == 20 && run.terminal.col == 0);
+    assert(!run.terminal.history_count);
     app_close(&run);
     environment_destroy(&environment);
 }
@@ -1457,7 +1665,8 @@ static void test_editor_and_layout(const char *executable) {
     app_send_text(&run, "\x1b[200~one\r\ntwo\t\x1b]0;PWN\x07three\x1b[201~");
     app_pump(&run, 100);
     assert(!bytes_contain(run.raw + replies_before, run.raw_len - replies_before,
-                          "Received:", strlen("Received:")));
+                          "Received: one", strlen("Received: one")));
+    assert(!vt_rows_contain(&run.terminal, "Working"));
     app_send_text(&run, "\r");
     assert(app_wait_raw(&run, "Received: one", 5000));
     assert(app_wait_raw(&run, "\\x1B]0;PWN\\x07three", 5000));
@@ -1465,14 +1674,20 @@ static void test_editor_and_layout(const char *executable) {
     assert(!bytes_contain(run.raw + replies_before, run.raw_len - replies_before,
                           "\x07", 1));
 
-    app_send_text(&run, "fixture:slow\rnext");
-    assert(app_wait_current(&run, "# next", 2000));
-    assert(app_wait_cursor(&run, "# next", 8, 1000));
-    app_send_text(&run, "\rdraft\x18");
-    assert(app_wait_current(&run, "# next", 2000));
+    assert(app_wait_current_absent(&run, "Working", 3000));
+    app_settle(&run);
+    app_send_text(&run, "fixture:hang\r");
+    assert(app_wait_current(&run, "Working", 3000));
+    app_send_text(&run, "next\r");
+    assert(app_wait_current(&run, "queued: next", 3000));
+    app_send_text(&run, "draft");
+    assert(app_wait_cursor(&run, "# draft", 9, 3000));
+    app_send_text(&run, "\x18");
+    assert(app_wait_current(&run, "# next", 3000));
+    assert(app_wait_current_absent(&run, "queued:", 3000));
     assert(vt_rows_contain(&run.terminal, "Working"));
-    assert(app_wait_raw(&run, "tick 59", 5000));
-    assert(app_wait_current_absent(&run, "Working", 2000));
+    app_send_text(&run, "\x1b");
+    assert(app_wait_current_absent(&run, "Working", 3000));
     assert(!strstr(run.raw, "Received: next"));
     app_send_text(&run, "\r");
     assert(app_wait_raw(&run, "Received: next", 5000));
@@ -1599,7 +1814,7 @@ static void test_editor_and_layout(const char *executable) {
     app_settle(&run);
     size_t narrow_exit_at = run.raw_len;
     app_send_text(&run, "\x03");
-    /* The persistent chat hint can wrap into scrollback in this short view. */
+    /* The persistent chat hint may be clipped in this short view. */
     assert(app_wait_raw_after(&run, narrow_exit_at, "Press Ctrl+D", 2000));
 
     app_send_text(&run, "safe\x1b[200~");
@@ -1623,9 +1838,9 @@ static void test_editor_and_layout(const char *executable) {
     assert(app_wait_anywhere(&run, "Paste rejected", 5000));
     assert(app_wait_current(&run, "# keep", 2000));
     app_send_text(&run, "\r");
-    assert(app_wait_raw(&run, "Received: keep", 5000));
+    assert(app_wait_anywhere(&run, "Received: keep", 5000));
 
-    assert(run.terminal.history_count > 0);
+    assert(run.terminal.alternate_screen && !run.terminal.history_count);
     assert(!vt_history_contains(&run.terminal, "[1 skills]"));
     assert(!run.terminal.nondefault_margin);
     app_quit_without_save(&run);
@@ -1882,7 +2097,7 @@ static void test_session_replay(const char *executable) {
     assert(!strstr(run.raw, "replayed result"));
     app_send_text(&run, "\x0f");
     app_settle(&run);
-    assert(!run.terminal.alternate_screen && !strstr(run.raw, "replayed result"));
+    assert(run.terminal.alternate_screen && !strstr(run.raw, "replayed result"));
     assert(!strstr(run.raw, "Tool: read") && !strstr(run.raw, "read: replayed"));
     app_send_text(&run, "fixture:ask\r");
     assert(app_wait_current(&run, "Which color?", 3000));
@@ -1927,6 +2142,17 @@ static void test_session_replay(const char *executable) {
             app_send_text(&run, "/resume\r");
             assert(app_wait_current(&run, "memo.txt", 3000));
             app_send_text(&run, "\r");
+        }
+        /* Replay enters retained history; visit its pages before checking
+         * the emitted styles and visibility of earlier tool results. */
+        assert(app_wait_current(&run, "Ask OCA anything", 3000));
+        for (int page = 0; page < 30; page++) {
+            app_send_text(&run, "\x1b[5~");
+            app_settle(&run);
+        }
+        for (int page = 0; page < 30; page++) {
+            app_send_text(&run, "\x1b[6~");
+            app_settle(&run);
         }
         assert(app_wait_raw(&run, "\x1b[1m[read]\x1b[0m memo.txt (lines 2-2)", 3000));
         assert(app_wait_raw(&run, "replayed result", 3000));
@@ -2000,7 +2226,10 @@ static void test_manual_bash(const char *executable) {
     app_send_text(&run, "! pwd\r");
     assert(app_wait_raw_after(&run, command_at, "\x1b[1m\x1b[32m[bash]\x1b[0m pwd", 3000));
     app_settle(&run);
-    assert(!strstr(run.raw + command_at, environment.workspace));
+    char hidden_output[256];
+    snprintf(hidden_output, sizeof(hidden_output), "\x1b[2K\x1b[0m  %s", environment.workspace);
+    /* The banner may redraw the workspace; Bash body rows must stay hidden. */
+    assert(!strstr(run.raw + command_at, hidden_output));
     command_at = run.raw_len;
     app_send_text(&run, "! exit 7\r");
     assert(app_wait_raw_after(&run, command_at, "\x1b[1m\x1b[32m[bash]\x1b[0m exit 7", 3000));
@@ -2087,9 +2316,10 @@ static void test_ephemeral_scrolling(const char *executable) {
     for (int i = 0; i < 50; i++)
         used += (size_t)snprintf(text + used, sizeof(text) - used, "main-line-%03d\n", i);
     app_paste_text(&run, text, 1);
-    assert(app_wait_raw(&run, "Received: main-line-000", 3000));
+    assert(app_wait_current(&run, "cache hit 60%", 3000));
     assert(app_wait_current_absent(&run, "Working", 3000));
     app_settle(&run);
+    assert(app_history_contains(&run, "Received: main-line-000"));
     size_t primary_history = run.terminal.history_count;
     app_send_text(&run, "/btw\r\r");
     assert(app_wait_current(&run, "Temporary chat", 3000));
@@ -2148,7 +2378,9 @@ static void test_ephemeral_scrolling(const char *executable) {
     assert(run.terminal.alternate_screen && last_view_line(&run.terminal, "main-line-") == last_main);
     size_t close_at = run.raw_len;
     for (int i = 0; i < 20; i++) app_send_text(&run, "\x1b[6~");
-    assert(app_wait_raw_after(&run, close_at, "\x1b[?1049l", 3000));
+    assert(app_wait_current(&run, "Received: main-new-hidden", 3000));
+    app_settle(&run);
+    assert(run.terminal.alternate_screen && !strstr(run.raw + close_at, "\x1b[?1049l"));
     assert_history_excludes(&run.terminal, "side-line-");
     app_quit_without_save(&run);
     app_close(&run);
@@ -2392,6 +2624,8 @@ int main(int argc, char **argv) {
     test_question_details(executable);
     test_goal_show_during_work(executable);
     test_resize_drag(executable);
+    test_resize_matrix(executable);
+    test_resize_restore(executable);
     test_brand(executable);
     test_startup_badges(executable);
     test_initial_prompt(executable);

@@ -519,6 +519,120 @@ static void test_retained_reflow(void) {
     app_free(&app);
 }
 
+static void test_history_paging_after_resize(void) {
+    tui_app app = {.cols = 80, .rows = 8, .history_rows = 4};
+    const char text[] = "A000B001C002D003E004F005G006H007I008J009"
+                        "K010L011M012N013O014P015Q016R017S018T019";
+    display_lines lines = {0};
+    conversation_wrap(&lines, CONVERSATION_ASSISTANT, 0, text, 80);
+    history_emit(&app, &lines, lines.count, 0);
+    lines_free(&lines);
+    assert(app.retained.count == 1);
+    app.cols = 4;
+    unsigned seen = 0;
+    for (int i = 0; i < 20; i++) {
+        overlay_history(&app, &lines, 4);
+        size_t first = lines.count > 4 ? lines.count - 4 : 0;
+        for (size_t k = first; k < lines.count; k++) {
+            unsigned letter = (unsigned)(lines.items[k].text[0] - 'A');
+            assert(letter < 20);
+            seen |= 1u << letter;
+        }
+        lines_free(&lines);
+        strcpy(app.escape, "\x1b[5~");
+        assert(escape_action(&app));
+    }
+    assert(seen == (1u << 20) - 1);
+    overlay_history(&app, &lines, 4);
+    assert(lines.count == 1 && !strcmp(lines.items[0].text, "A000"));
+    lines_free(&lines);
+    size_t end = app.view_end, skip = app.view_skip;
+    display_line newest = {.text = "new", .style = STYLE_RESET};
+    history_retain(&app, &newest);
+    assert(app.view_end == end && app.view_skip == skip);
+    for (int i = 0; i < 20; i++) {
+        strcpy(app.escape, "\x1b[6~");
+        assert(escape_action(&app));
+    }
+    assert(app.view_end == app.retained.count && !app.view_skip);
+    history_scroll(&app, -1, 10);
+    assert(app.view_skip);
+    app.cols = 80;
+    overlay_history(&app, &lines, 4);
+    assert(!app.view_skip && lines.count && !strcmp(lines.items[lines.count - 1].text, text));
+    lines_free(&lines);
+    app.cols = 4;
+    history_scroll(&app, -1, 10);
+    for (int i = 0; i < 80; i++) history_retain(&app, &newest);
+    assert(app.history_omitted && !app.view_skip);
+    history_scroll(&app, 1, 1000);
+    assert(app.view_end == app.retained.count && !app.view_skip);
+    app_free(&app);
+
+    for (int rows = 1; rows <= 2; rows++) {
+        memset(&app, 0, sizeof(app));
+        app.cols = 80;
+        app.history_rows = rows;
+        conversation_wrap(&lines, CONVERSATION_ASSISTANT, 0, "first\nlast", 80);
+        history_emit(&app, &lines, lines.count, 2);
+        lines_free(&lines);
+        history_scroll(&app, -1, 1);
+        overlay_history(&app, &lines, (size_t)rows);
+        assert(lines.count && lines.items[lines.count - 1].text[0]);
+        lines_free(&lines);
+        history_scroll(&app, 1, 1);
+        overlay_history(&app, &lines, (size_t)rows);
+        assert(app.view_end == app.retained.count && !app.view_skip);
+        int latest = 0;
+        for (size_t i = 0; i < lines.count; i++) latest |= !strcmp(lines.items[i].text, "last");
+        assert(latest);
+        lines_free(&lines);
+        app_free(&app);
+    }
+}
+
+static void test_mouse_scroll(void) {
+    tui_app app = {.cols = 80, .rows = 24, .history_rows = 10};
+    app.input = calloc(OCA_PROMPT_MAX_BYTES + 1, 1);
+    assert(app.input);
+    input_set(&app, "draft");
+    app.history = checked_realloc(NULL, sizeof(*app.history));
+    app.history[0] = copy_text("previous prompt");
+    app.history_count = app.history_at = 1;
+    for (int i = 0; i < 30; i++) {
+        display_line row = {.text = "output", .style = STYLE_RESET};
+        history_retain(&app, &row);
+    }
+    const char *up = "\x1b[<64;40;10M";
+    for (size_t i = 0; up[i]; i++) handle_byte(&app, (unsigned char)up[i]);
+    assert(app.view_end < app.retained.count || app.view_skip);
+    assert(!strcmp(app.input, "draft") && app.cursor == 5);
+    const char *down = "\x1b[<65;65535;65535M";
+    for (size_t i = 0; down[i]; i++) handle_byte(&app, (unsigned char)down[i]);
+    assert(app.view_end == app.retained.count && !app.view_skip);
+    const char *ignored[] = {"\x1b[<0;2;2M", "\x1b[<0;2;2m", "\x1b[<64;2;2m",
+        "\x1b[<66;2;2M", "\x1b[<64;0;2M", "\x1b[<64;-1;2M", "\x1b[<64;;2M", "\x1b[<64;999999999;2M",
+        "\x1b[<64;999999999999999999999999999999999999;2M"};
+    for (size_t n = 0; n < sizeof(ignored) / sizeof(ignored[0]); n++) {
+        for (size_t i = 0; ignored[n][i]; i++) handle_byte(&app, (unsigned char)ignored[n][i]);
+        assert(!strcmp(app.input, "draft") && app.cursor == 5 && !app.escape_len);
+        assert(app.view_end == app.retained.count && !app.view_skip);
+    }
+    app.menu = MENU_HELP;
+    for (size_t i = 0; up[i]; i++) handle_byte(&app, (unsigned char)up[i]);
+    assert(app.menu == MENU_HELP && !strcmp(app.input, "draft"));
+    app.menu = MENU_NONE;
+    const char *partial = "\x1b[<64;";
+    for (size_t i = 0; partial[i]; i++) handle_byte(&app, (unsigned char)partial[i]);
+    escape_fallback(&app);
+    assert(!strcmp(app.input, "draft") && !app.escape_len);
+    input_set(&app, "");
+    const char *arrow = "\x1b[A";
+    for (size_t i = 0; arrow[i]; i++) handle_byte(&app, (unsigned char)arrow[i]);
+    assert(!strcmp(app.input, "previous prompt"));
+    app_free(&app);
+}
+
 static void test_question_replay(void) {
     tui_app app = {.hidden = 1, .cols = 80, .rows = 24};
     app.tool_arguments = copy_text("{\"questions\":[{\"question\":\"Pick a `compiler`?\",\"options\":[\"gcc\",\"clang\"]}]}");
@@ -621,6 +735,53 @@ static void test_inline_question(void) {
     app_free(&app);
 }
 
+static void test_question_resize_reflow(void) {
+    char *options[] = {"👩‍💻"};
+    oca_interaction_question question = {
+        .question = "界?", .options = options, .option_count = 1
+    };
+    const char *answer = "👩‍💻\n\nDetails: é\nz\n";
+    display_lines expected = {0};
+    question_answer_lines(&expected, &question, answer, 80);
+    assert(expected.count == 7);
+    assert(!strcmp(expected.items[1].accent_style, STYLE_RESET STYLE_BOLD));
+    assert(text_columns(expected.items[5].text) == 80);
+    display_lines fields = {0};
+    question_wrap(&fields, STYLE_SELECTED, "a\n", 8);
+    assert(fields.count == 2 && !strcmp(fields.items[0].text, "a"));
+    assert(!*fields.items[1].text && !strcmp(fields.items[1].style, STYLE_SELECTED));
+    lines_free(&fields);
+    for (int cols = 1; cols <= 24; cols++) {
+        tui_app history = {.hidden = 1, .cols = 80, .rows = 24};
+        display_lines lines = {0};
+        question_answer_lines(&lines, &question, answer, cols);
+        assert(lines.items[0].card_first && lines.items[lines.count - 1].card_last);
+        for (size_t i = 0; i < lines.count; i++)
+            assert(text_columns(lines.items[i].text) <= cols);
+        history_emit(&history, &lines, lines.count, 0);
+        lines_free(&lines);
+        for (int pass = 0; pass < 2; pass++) {
+            overlay_history(&history, &lines, 24);
+            assert(lines.count == expected.count);
+            for (size_t i = 0; i < lines.count; i++) {
+                assert(!strcmp(lines.items[i].text, expected.items[i].text));
+                assert(!strcmp(lines.items[i].style, expected.items[i].style));
+                assert((lines.items[i].accent_style != NULL) ==
+                       (expected.items[i].accent_style != NULL));
+                if (lines.items[i].accent_style)
+                    assert(!strcmp(lines.items[i].accent_style, expected.items[i].accent_style));
+            }
+            lines_free(&lines);
+            history.cols = 1;
+            overlay_history(&history, &lines, 24);
+            lines_free(&lines);
+            history.cols = 80;
+        }
+        app_free(&history);
+    }
+    lines_free(&expected);
+}
+
 static void test_ambiguous_question_replay(void) {
     tui_app app = {.hidden = 1, .cols = 80, .rows = 24};
     app.tool_arguments = copy_text("{\"questions\":[{\"question\":\"First?\",\"options\":[\"A\",\"B\"]},"
@@ -642,7 +803,7 @@ static int history_contains(const tui_app *app, const char *text) {
 }
 
 static void test_bash_output(void) {
-    tui_app app = {.hidden = 1, .overlay = 1, .cols = 80, .rows = 24};
+    tui_app app = {.hidden = 1, .cols = 80, .rows = 24};
     oca_core_event event = {.kind = OCA_CE_TOOL_START, .name = "bash", .detail = "run-1",
                            .text = "{\"command\":\"printf log\"}"};
     handle_event(&app, &event);
@@ -661,7 +822,7 @@ static void test_bash_output(void) {
     assert(!history_contains(&app, "output-") && !history_contains(&app, "[exit"));
     size_t rows = app.retained.count;
     handle_byte(&app, 0x0f);
-    assert(app.retained.count == rows && app.overlay);
+    assert(app.retained.count == rows);
 
     event = (oca_core_event){.kind = OCA_CE_TOOL_START, .name = "bash", .detail = "run-2",
                             .text = "{\"command\":\"exit 7\"}"};
@@ -704,7 +865,7 @@ static char *capture_read(FILE *capture) {
     return text;
 }
 
-static void test_tool_output(FILE *capture) {
+static void test_tool_output(void) {
     tui_app app = {.cols = 80, .rows = 24};
     app.tool_name = copy_text("edit");
     app.tool_arguments = copy_text("{\"path\":\"file.c\"}");
@@ -743,66 +904,66 @@ static void test_tool_output(FILE *capture) {
     lines_free(&lines);
     app_free(&app);
     memset(&app, 0, sizeof(app));
-    long start = ftell(capture);
-    assert(start >= 0);
     oca_core_event event = {.name = "read", .detail = "failed-read", .text = "{\"path\":\"file.txt\"}"};
     tool_start(&app, &event);
     event.text = "file unavailable";
     event.tool_state = OCA_TOOL_ERROR;
     tool_result(&app, &event);
-    char *output = capture_read(capture), *plain = without_styles(output + start);
+    assert(app.retained.count > 0);
+    char *plain = without_styles(app.retained.items[0].text);
     assert(strstr(plain, "[read] file.txt (failed)") && !strstr(plain, "file unavailable"));
     assert(!strstr(plain, "✦") && !strstr(plain, "ctrl"));
     free(plain);
-    free(output);
     app_free(&app);
 }
 
-static void test_brand_paths(FILE *capture) {
+static void test_brand_paths(void) {
     char long_path[512];
     snprintf(long_path, sizeof(long_path), "/tmp/");
     for (int i = 0; i < 100; i++) strcat(long_path, "界");
     const char *paths[] = {"/", long_path, "/tmp/\x1b]0;PWN\a"};
+    const int widths[] = {12, 40, 80, 160};
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-        long start = ftell(capture);
-        assert(start >= 0);
-        tui_app app = {.workspace = paths[i]};
-        print_brand(&app);
-        char *output = capture_read(capture);
-        const char *frame = strstr(output + start, "╭");
-        assert(frame && !strstr(output + start, "\x1b]0;PWN"));
-        char *plain = without_styles(frame);
-        char *line = plain;
-        for (int row = 0; row < 5; row++) {
-            char *end = strchr(line, '\r');
-            assert(end && end[1] == '\n');
-            *end = 0;
-            assert(text_columns(line) <= app.cols);
-            if (row > 0 && row < 4) {
-                size_t length = strlen(line);
-                assert(!memcmp(line + length - strlen("│"), "│", strlen("│")));
+        for (size_t k = 0; k < sizeof(widths) / sizeof(widths[0]); k++) {
+            tui_app app = {.workspace = paths[i], .cols = widths[k], .rows = 24};
+            display_lines lines = {0};
+            brand_lines(&app, &lines);
+            assert(lines.count == 5);
+            for (size_t row = 0; row < lines.count; row++) {
+                assert(!strstr(lines.items[row].text, "\x1b]0;PWN"));
+                char *plain = without_styles(lines.items[row].text);
+                assert(text_columns(plain) <= app.cols);
+                if (row > 0 && row < 4) {
+                    size_t length = strlen(plain);
+                    assert(!memcmp(plain + length - strlen("│"), "│", strlen("│")));
+                }
+                free(plain);
             }
-            line = end + 2;
+            lines_free(&lines);
         }
-        free(plain);
-        free(output);
     }
 }
 
-static void test_goal_output(FILE *capture) {
-    long start = ftell(capture);
+static void test_goal_output(void) {
     tui_app app = {.cols = 80, .rows = 24};
     oca_core_event event = {.kind = OCA_CE_GOAL, .goal = OCA_GOAL_COMPLETED,
         .goal_elapsed_ms = 3723004, .text = "Done"};
     handle_event(&app, &event);
     event.goal = OCA_GOAL_BLOCKED;
     handle_event(&app, &event);
-    char *text = capture_read(capture);
-    assert(strstr(text + start, "goal completed: " STYLE_MUTED "Done"));
-    assert(!strstr(text + start, "Active time:"));
-    assert(strstr(text + start, "goal blocked"));
-    assert(!strstr(text + start, "goal_status"));
-    free(text);
+    assert(history_contains(&app, "goal completed: " STYLE_MUTED "Done"));
+    assert(!history_contains(&app, "Active time:"));
+    assert(history_contains(&app, "goal blocked"));
+    assert(!history_contains(&app, "goal_status"));
+    display_lines page = {0};
+    overlay_history(&app, &page, 24);
+    int colored = 0;
+    for (size_t i = 0; i < page.count; i++) {
+        assert(!strstr(page.items[i].text, "\\x1B"));
+        colored |= strstr(page.items[i].text, STYLE_PURPLE "goal completed") != NULL;
+    }
+    assert(colored);
+    lines_free(&page);
     app_free(&app);
 }
 
@@ -827,21 +988,17 @@ static void test_stream(FILE *capture) {
         stream_append(&app, CONVERSATION_ASSISTANT, row);
         stream_commit(&app, 0);
         assert(app.stream_text_len == 0);
+        row[strlen(row) - 1] = 0;
+        assert(history_contains(&app, row));
     }
-    text = capture_read(capture);
-    for (int i = 0; i < 180; i++) {
-        char row[64];
-        snprintf(row, sizeof(row), "answer-row-%03d", i);
-        assert(strstr(text, row));
-    }
-    assert(!strstr(text, "..."));
-    free(text);
     stream_commit(&app, 1);
+    assert(!history_contains(&app, "answer-row-000"));
+    assert(history_contains(&app, "answer-row-179"));
     assert(app.retained.count <= VIEW_HISTORY_MAX_ROWS);
     assert(app.retained_bytes <= VIEW_HISTORY_MAX_BYTES);
     app_free(&app);
 
-    tui_app visible = { .cols = 80, .rows = 24, .overlay = 1 };
+    tui_app visible = { .cols = 80, .rows = 24 };
     tui_app hidden = { .hidden = 1, .side_chat = 1, .main_view = &visible, .cols = 80, .rows = 24 };
     visible.active_view = &visible;
     visible.display.show_reasoning = hidden.display.show_reasoning = 1;
@@ -861,7 +1018,6 @@ static void test_stream(FILE *capture) {
         stream_commit(&hidden, 0);
     }
     stream_commit(&hidden, 1);
-    history_flush(&hidden);
     assert(!visible.restore_pending && hidden.history_omitted);
     assert(hidden.retained.count <= VIEW_HISTORY_MAX_ROWS);
     assert(hidden.retained_bytes <= VIEW_HISTORY_MAX_BYTES);
@@ -933,7 +1089,7 @@ static void test_visibility(void) {
                             assert(italic);
                         }
                         lines_free(&app.retained);
-                        app.retained_bytes = app.flushed_rows = 0;
+                        app.retained_bytes = app.view_end = 0;
                     }
                 }
                 app_free(&app);
@@ -1107,8 +1263,11 @@ int main(void) {
     test_programming_hint_rendering();
     test_tables();
     test_retained_reflow();
+    test_history_paging_after_resize();
+    test_mouse_scroll();
     test_question_replay();
     test_inline_question();
+    test_question_resize_reflow();
     test_ambiguous_question_replay();
     test_prompt_history();
     test_bash_output();
@@ -1117,11 +1276,11 @@ int main(void) {
     int saved_stdout = dup(STDOUT_FILENO);
     assert(saved_stdout >= 0);
     assert(dup2(fileno(capture), STDOUT_FILENO) >= 0);
-    test_brand_paths(capture);
-    test_goal_output(capture);
+    test_brand_paths();
+    test_goal_output();
     test_stream(capture);
     test_visibility();
-    test_tool_output(capture);
+    test_tool_output();
     assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
     close(saved_stdout);
     fclose(capture);

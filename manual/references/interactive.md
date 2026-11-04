@@ -8,6 +8,8 @@
 | Ctrl+J | Insert a newline. |
 | Tab | Switch between question choices and details when the details field is empty. |
 | Up/Down | Move through input rows, history, or menu choices. |
+| Mouse wheel / touchpad | Scroll conversation output. Hold Shift to select text with the mouse. |
+| PageUp/PageDown | Browse retained conversation output in the current chat. |
 | Esc | Close a menu or interrupt work. Pending messages then send as soon as possible. |
 | Ctrl+X | Retrieve the oldest queued message into the editor, replacing the draft without interrupting work. |
 | Ctrl+C during main-chat work | Clear a nonempty draft. With empty input, remove the oldest queued message if present; otherwise do nothing. Use Esc to interrupt work. |
@@ -129,7 +131,6 @@ The TUI adds no blank rows before this state; blank rows produced by the command
 remain visible. Success adds no completion line; interruption uses `(interrupted)`.
 Replay uses the same format.
 The stored execution footer remains available to the model.
-PageUp/PageDown still navigate retained conversation history in alternate views.
 
 Model text formats inline code in cyan, bold text, italic text, and boxed tables
 with aligned, wrapped cells. Recognized inline delimiters become terminal styles.
@@ -146,9 +147,10 @@ code blocks and inline occurrences remain ordinary content.
 
 ## Status and Transcript
 
-The welcome banner shows the workspace and `[AGENTS.md]` when project instructions
-are loaded. Use `/skills` to list available skills. The status bar shows the selected
-model, reasoning, active-context usage, and the most recent available cache-hit
+The welcome banner starts at the top of the screen. It shows the workspace and
+`[AGENTS.md]` when project instructions are loaded. Use `/skills` to list available
+skills. The status bar shows the selected model, reasoning, active-context usage,
+and the most recent available cache-hit
 percentage. The context count is the provider-reported input for the latest
 completed request. Before a measurement is available, it appears as a dash.
 The denominator is OCA's input budget after the output reserve, not the model's
@@ -172,6 +174,9 @@ There are no Reasoning or Reasoned timers or completion labels.
 The Working indicator continues to show elapsed work time.
 The transcript separates messages with two blank lines.
 
-OCA uses the terminal's main screen and scrollback. Resizing updates the live
-interface; historical rows remain partly under terminal control. Known
-real-terminal resizing problems remain unresolved.
+OCA uses the terminal's alternate screen throughout the interactive session.
+Resizing reflows retained conversation output and updates the editor, menus,
+and status bar. PageUp/PageDown browse retained output in both the main and
+temporary chats. Exiting restores the terminal's previous screen and scrollback.
+Save the conversation to reopen it later; chat output does not enter the shell's
+scrollback.
