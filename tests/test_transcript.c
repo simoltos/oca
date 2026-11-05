@@ -1374,8 +1374,63 @@ static void test_prompt_history(void) {
     assert(unlink(path) == 0 && rmdir(directory) == 0 && rmdir(home) == 0);
 }
 
+static void test_selection(void) {
+    tui_app app = {.cols = 20};
+    display_lines frame = {0};
+    display_line row = {.text = "ab\x1b[31mcé界\x1b[0m end"};
+    selection_row(&frame, &row);
+    selection_frame(&app, &frame);
+    assert(!strcmp(app.screen.items[0].text, "abcé界 end"));
+    strcpy(app.escape, "\x1b[<0;2;1M"); mouse_report(&app);
+    strcpy(app.escape, "\x1b[<32;6;1M"); mouse_report(&app);
+    strcpy(app.escape, "\x1b[<0;6;1m"); mouse_report(&app);
+    assert(!app.selecting && app.selected);
+    text_buffer text = {0};
+    selection_text(&app, &text);
+    assert(!strcmp(text.data, "bcé界"));
+    buffer_free(&text);
+    FILE *capture = tmpfile();
+    assert(capture);
+    int saved = dup(STDOUT_FILENO);
+    assert(saved >= 0 && dup2(fileno(capture), STDOUT_FILENO) >= 0);
+    strcpy(app.escape, "\x1b[99;6u");
+    assert(escape_action(&app));
+    assert(dup2(saved, STDOUT_FILENO) >= 0);
+    close(saved);
+    rewind(capture);
+    char copied[128] = {0};
+    assert(fread(copied, 1, sizeof(copied) - 1, capture) > 0);
+    assert(!strcmp(copied, "\x1b]52;c;YmPDqeeVjA==\x1b\\"));
+    fclose(capture);
+    size_t swap = app.selection_anchor;
+    app.selection_anchor = app.selection_end; app.selection_end = swap;
+    selection_text(&app, &text);
+    assert(!strcmp(text.data, "bcé界"));
+    buffer_free(&text);
+    selection_row(&frame, &row); selection_frame(&app, &frame);
+    assert(app.selected);
+    app.cols = 10;
+    selection_row(&frame, &row); selection_frame(&app, &frame);
+    assert(!app.selected);
+    lines_free(&app.screen);
+    app.cols = 10;
+    row.text = "first"; row.soft_wrap = 1;
+    selection_row(&frame, &row);
+    row.text = "second"; row.soft_wrap = 0;
+    selection_row(&frame, &row);
+    row.text = "third";
+    selection_row(&frame, &row);
+    selection_frame(&app, &frame);
+    app.selected = 1; app.selection_anchor = 0; app.selection_end = 25;
+    selection_text(&app, &text);
+    assert(!strcmp(text.data, "firstsecond\nthird"));
+    buffer_free(&text);
+    lines_free(&app.screen);
+}
+
 int main(void) {
     assert(setlocale(LC_CTYPE, "C.UTF-8"));
+    test_selection();
     test_wrapping();
     test_help_layout();
     test_question_editor_marker();

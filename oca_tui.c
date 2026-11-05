@@ -171,6 +171,10 @@ struct tui_app {
     int welcome_pending;
     int show_brand;
     int history_omitted;
+    display_lines screen;       /* Plain text of the last painted frame. */
+    int selecting, selected;
+    size_t selection_anchor, selection_end; /* Screen cell offsets. */
+    int screen_cols;
     display_lines retained;
     size_t retained_bytes;
     size_t view_end;
@@ -388,7 +392,7 @@ static void terminal_restore(void) {
     terminal_state *term = active_terminal;
     if (!term || !term->active) return;
     if (term->alternate_screen) {
-        write_text("\x1b[?1000l\x1b[?1006l\x1b[?1049l");
+        write_text("\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?1049l");
         term->alternate_screen = 0;
     }
     if (term->title_saved) write_text("\x1b[23;2t");
@@ -470,7 +474,7 @@ static int terminal_enter(terminal_state *term) {
     active_terminal = term;
     atexit(terminal_restore);
     term->alternate_screen = 1;
-    write_text("\x1b[?1049h\x1b[H\x1b[2J" STYLE_RESET "\x1b[?7h\x1b[?2004h\x1b[?1006h\x1b[?1000h\x1b[?25h");
+    write_text("\x1b[?1049h\x1b[H\x1b[2J" STYLE_RESET "\x1b[?7h\x1b[?2004h\x1b[?1006h\x1b[?1000h\x1b[?1002h\x1b[?25h");
     return 0;
 }
 
@@ -1157,6 +1161,103 @@ static void write_display_line(const display_line *line, int cols) {
         while (spaces-- > 0) write_text(" ");
     }
     write_text(STYLE_RESET);
+}
+
+/* Selection uses the painted text, with terminal styles removed. Cell positions
+ * always expand to whole graphemes, including wide and combining characters. */
+static void selection_bounds(const tui_app *app, size_t *start, size_t *end) {
+    *start = app->selection_anchor < app->selection_end ? app->selection_anchor : app->selection_end;
+    *end = app->selection_anchor > app->selection_end ? app->selection_anchor : app->selection_end;
+}
+
+static void selection_frame(tui_app *app, display_lines *frame) {
+    if (app->screen_cols != app->cols) app->selected = app->selecting = 0;
+    if (app->selected) {
+        size_t start, end;
+        selection_bounds(app, &start, &end);
+        for (size_t row = start / (size_t)app->cols; row <= (end > start ? end - 1 : end) / (size_t)app->cols; row++) {
+            if (row >= frame->count || row >= app->screen.count ||
+                strcmp(frame->items[row].text, app->screen.items[row].text)) {
+                app->selected = app->selecting = 0;
+                break;
+            }
+        }
+    }
+    lines_free(&app->screen);
+    app->screen = *frame;
+    memset(frame, 0, sizeof(*frame));
+    app->screen_cols = app->cols;
+}
+
+static void selection_row(display_lines *frame, const display_line *line) {
+    text_buffer plain = {0};
+    const char *text = line ? line->text : "";
+    for (size_t at = 0, len = strlen(text); at < len;) {
+        size_t sgr = sgr_length(text + at);
+        if (sgr) { at += sgr; continue; }
+        size_t end = next_grapheme(text, len, at);
+        buffer_append(&plain, text + at, end - at);
+        at = end;
+    }
+    lines_add(frame, STYLE_RESET, plain.data ? plain.data : "", plain.length);
+    frame->items[frame->count - 1].soft_wrap = line ? line->soft_wrap : 0;
+    buffer_free(&plain);
+}
+
+/* Draw or collect the same range, so the clipboard matches the highlight. */
+static void selection_text(tui_app *app, text_buffer *out) {
+    if (!app->selected || app->screen_cols <= 0) return;
+    size_t start, end;
+    selection_bounds(app, &start, &end);
+    if (start == end) return;
+    size_t cols = (size_t)app->screen_cols;
+    for (size_t row = start / cols; row <= (end - 1) / cols && row < app->screen.count; row++) {
+        const display_line *line = &app->screen.items[row];
+        size_t low = row == start / cols ? start % cols : 0;
+        size_t high = row == end / cols ? end % cols : cols;
+        size_t column = 0, len = strlen(line->text), begin = SIZE_MAX, finish = 0, first_col = 0;
+        for (size_t at = 0; at < len;) {
+            size_t next = next_grapheme(line->text, len, at);
+            size_t width = (size_t)grapheme_columns(line->text + at, next - at);
+            if (column < high && column + width > low) {
+                if (begin == SIZE_MAX) { begin = at; first_col = column; }
+                finish = next;
+            }
+            column += width;
+            at = next;
+        }
+        if (begin != SIZE_MAX) {
+            if (out) buffer_append(out, line->text + begin, finish - begin);
+            else {
+                char position[64];
+                snprintf(position, sizeof(position), "\x1b[%zu;%zuH" STYLE_RESET "\x1b[7m", row + 1, first_col + 1);
+                write_text(position);
+                write_all(line->text + begin, finish - begin);
+                write_text(STYLE_RESET);
+            }
+        }
+        if (out && row < (end - 1) / cols && !line->soft_wrap) buffer_append(out, "\n", 1);
+    }
+}
+
+static void selection_copy(tui_app *app) {
+    text_buffer text = {0};
+    selection_text(app, &text);
+    if (text.length) {
+        static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        write_text("\x1b]52;c;");
+        for (size_t i = 0; i < text.length; i += 3) {
+            unsigned value = (unsigned char)text.data[i] << 16;
+            if (i + 1 < text.length) value |= (unsigned char)text.data[i + 1] << 8;
+            if (i + 2 < text.length) value |= (unsigned char)text.data[i + 2];
+            char encoded[4] = {alphabet[value >> 18], alphabet[(value >> 12) & 63],
+                i + 1 < text.length ? alphabet[(value >> 6) & 63] : '=',
+                i + 2 < text.length ? alphabet[value & 63] : '='};
+            write_all(encoded, sizeof(encoded));
+        }
+        write_text("\x1b\\");
+    }
+    buffer_free(&text);
 }
 
 /* ============================================================================
@@ -2613,8 +2714,11 @@ static void render_block(tui_app *app) {
     size_t shown = page.count < (size_t)history_rows ? page.count : (size_t)history_rows;
     /* Keep a fully visible welcome banner at the top of the viewport. */
     size_t padding = has_brand && page.count == shown ? 0 : (size_t)history_rows - shown;
+    display_lines frame = {0};
     write_text("\x1b[H\x1b[2J");
     for (int i = 0; i < history_rows; i++) {
+        selection_row(&frame, (size_t)i >= padding && (size_t)i - padding < shown ?
+            &page.items[page.count - shown + (size_t)i - padding] : NULL);
         if ((size_t)i >= padding && (size_t)i - padding < shown)
             write_display_line(&page.items[page.count - shown + (size_t)i - padding], app->cols);
         write_text("\r\n");
@@ -2622,9 +2726,12 @@ static void render_block(tui_app *app) {
     lines_free(&page);
     desired += history_rows;
     for (size_t i = 0; i < lines.count; i++) {
+        selection_row(&frame, &lines.items[i]);
         write_display_line(&lines.items[i], app->cols);
         if (i + 1 < lines.count) write_text("\r\n");
     }
+    selection_frame(app, &frame);
+    selection_text(app, NULL);
     char position[48];
     snprintf(position, sizeof(position), "\x1b[%d;1H", desired + 1);
     write_text(position);
@@ -4201,8 +4308,7 @@ static void cycle_reasoning(tui_app *app, int direction) {
  * Input decoding and lifecycle
  * ========================================================================== */
 
-/* SGR mouse reports keep wheel input distinct from cursor keys. Clicks and
- * releases are consumed without editing the draft or changing menu choices. */
+/* SGR reports keep selection and wheel input separate from editor keys. */
 static void mouse_report(tui_app *app) {
     const char *at = app->escape + 3;
     unsigned values[3] = {0};
@@ -4215,9 +4321,26 @@ static void mouse_report(tui_app *app) {
         if (i < 2 && *at++ != ';') return;
     }
     if ((*at != 'M' && *at != 'm') || at[1] || !values[1] || !values[2]) return;
+    if (app->screen.count && app->screen_cols > 0 && (values[0] & ~32u) == 0) {
+        size_t row = values[2] - 1, col = values[1] - 1;
+        if (row >= app->screen.count) row = app->screen.count - 1;
+        if (col >= (size_t)app->screen_cols) col = (size_t)app->screen_cols - 1;
+        size_t cell = row * (size_t)app->screen_cols + col;
+        if (*at == 'M' && values[0] == 0) {
+            app->selection_anchor = app->selection_end = cell;
+            app->selected = app->selecting = 1;
+        } else if (app->selecting) {
+            app->selection_end = cell;
+            if (cell > app->selection_anchor && col + 1 == (size_t)app->screen_cols)
+                app->selection_end++;
+            if (*at == 'm') app->selecting = 0;
+        }
+        app->dirty = app->redraw_urgent = 1;
+    }
     unsigned button = values[0] & ~28u; /* Shift, Alt, Ctrl do not change direction. */
     if (*at == 'M' && (button == 64 || button == 65) &&
         app->menu == MENU_NONE && app->history_rows + app->preview_rows > 0) {
+        app->selected = app->selecting = 0;
         history_scroll(app, button == 64 ? -1 : 1, 3);
         app->dirty = app->redraw_urgent = 1;
     }
@@ -4228,7 +4351,7 @@ static int escape_match(const char *text, size_t len, int complete) {
         "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[H", "\x1b[F",
         "\x1b[1~", "\x1b[4~", "\x1b[7~", "\x1b[8~", "\x1bOH", "\x1bOF",
         "\x1b[3~", "\x1b[200~", "\x1b[201~", "\x1b[Z", "\x1b[47;5u",
-        "\x1b[5~", "\x1b[6~",
+        "\x1b[5~", "\x1b[6~", "\x1b[99;6u", "\x1b[27;6;99~", "\x1b[27;6;67~", "\x1b[67;6u",
         "\x1bk", "\x1bl", "\x1bK", "\x1bL", "\x1b,", "\x1b."
     };
     for (size_t i = 0; i < sizeof(sequences) / sizeof(sequences[0]); i++) {
@@ -4245,6 +4368,11 @@ static int escape_prefix(const char *text, size_t len) {
 static int escape_action(tui_app *app) {
     const char *sequence = app->escape;
     if (!escape_match(sequence, strlen(sequence), 1)) return 0;
+    if (!strcmp(sequence, "\x1b[99;6u") || !strcmp(sequence, "\x1b[27;6;99~") ||
+        !strcmp(sequence, "\x1b[27;6;67~") || !strcmp(sequence, "\x1b[67;6u")) {
+        selection_copy(app);
+        return 1;
+    }
     if ((menu_yes_no(app->menu)) &&
         strcmp(sequence, "\x1b[200~") && strcmp(sequence, "\x1b[201~")) return 1;
     if (strcmp(sequence, "\x1b[A") && strcmp(sequence, "\x1b[B")) app->vertical_move = 0;
@@ -4663,6 +4791,7 @@ static void handle_byte(tui_app *app, unsigned char byte) {
 }
 
 static void app_free(tui_app *app) {
+    lines_free(&app->screen);
     menu_clear(app);
     interaction_free(app);
     stream_clear(app);

@@ -184,3 +184,9 @@ bottom resumes the current output. Exiting restores the terminal's previous
 screen and scrollback.
 Save the conversation to reopen it later; chat output does not enter the shell's
 scrollback.
+
+Drag with the left mouse button to select visible text without Shift. Press
+Ctrl+Shift+C to copy the selection in terminals that forward this shortcut,
+including Ghostty. OCA sends the text through OSC 52; the terminal must allow
+clipboard writes. Releasing the mouse does not copy. Scrolling, resizing, or
+changes to selected rows clear the selection.
